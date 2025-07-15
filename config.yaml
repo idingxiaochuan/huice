@@ -1,0 +1,14 @@
+backtest:
+  batch_size: 100
+  default_stock: 515170.SH
+  initial_capital: 100000.0
+database:
+  dbname: huice
+  host: 127.0.0.1
+  password: postgres
+  port: 5432
+  user: postgres
+ui:
+  chart_height: 600
+  refresh_interval: 200
+  trade_panel_height: 200

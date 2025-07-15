@@ -1,0 +1,579 @@
+from flask import Blueprint, jsonify, request, Response, stream_with_context
+import logging
+import traceback
+import sys
+import os
+import threading
+import time
+from datetime import datetime
+import json
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# 全局变量定义
+xtdata = None
+xtdata_initialized = False
+xtdata_thread = None
+xtdata_ready_event = threading.Event()
+
+# 全局缓存
+market_data_cache = {}
+last_update_time = {}
+
+# 创建Blueprint
+market_api = Blueprint('market_api', __name__)
+
+def find_qmt_path():
+    """寻找QMT的安装路径"""
+    # 常见的QMT安装路径
+    possible_paths = [
+        r"D:\国金QMT交易端模拟\userdata_mini",
+        r"C:\国金QMT交易端模拟\userdata_mini",
+        r"D:\国金证券QMT交易端\userdata_mini",
+        r"C:\国金证券QMT交易端\userdata_mini",
+        r"C:\Program Files\国金证券QMT交易端\userdata_mini",
+        r"C:\Program Files (x86)\国金证券QMT交易端\userdata_mini",
+        r"C:\Program Files\国金QMT交易端模拟\userdata_mini",
+        r"C:\Program Files (x86)\国金QMT交易端模拟\userdata_mini",
+        r"C:\Users\Administrator\Desktop\国金QMT交易端模拟\userdata_mini",
+        r"C:\Users\Administrator\Desktop\国金证券QMT交易端\userdata_mini",
+    ]
+    
+    # 尝试所有可能的路径
+    for path in possible_paths:
+        if os.path.exists(path):
+            lib_path = os.path.join(path, 'lib', 'site-packages')
+            if os.path.exists(lib_path):
+                logger.info(f"找到QMT路径: {path}")
+                return path
+    
+    logger.warning("未找到QMT路径，可能需要手动设置")
+    return None
+
+def run_xtdata_in_background():
+    """后台运行xtdata.run()"""
+    global xtdata
+    
+    logger.info("启动xtdata后台线程")
+    try:
+        # 设置就绪事件
+        xtdata_ready_event.set()
+        
+        # 运行xtdata.run()
+        logger.info("尝试运行QMT交易系统...")
+        xtdata.run()
+    except Exception as e:
+        logger.error(f"运行xtdata出错: {str(e)}")
+        logger.error(traceback.format_exc())
+
+def start_xtdata_thread():
+    """启动后台线程"""
+    global xtdata_thread
+    if xtdata_thread is None or not xtdata_thread.is_alive():
+        xtdata_thread = threading.Thread(target=run_xtdata_in_background, daemon=True)
+        xtdata_thread.start()
+        logger.info("xtdata线程已启动")
+    else:
+        logger.info("xtdata线程已在运行")
+
+def initialize_xtquant():
+    """初始化xtquant库"""
+    global xtdata, xtdata_initialized
+    
+    # 如果已经初始化，直接返回
+    if xtdata_initialized and xtdata is not None:
+        logger.info("xtquant已初始化")
+        return True
+    
+    # 寻找QMT路径
+    qmt_path = find_qmt_path()
+    if not qmt_path:
+        logger.error("无法找到QMT路径，无法导入xtquant")
+        return False
+    
+    # 添加xtquant库路径
+    lib_path = os.path.join(qmt_path, 'lib', 'site-packages')
+    if lib_path not in sys.path:
+        sys.path.insert(0, lib_path)
+    
+    # 导入xtquant
+    try:
+        from xtquant import xtdata as xt
+        xtdata = xt
+        logger.info(f"成功导入xtquant库，路径: {lib_path}")
+        
+        # 重置就绪事件
+        xtdata_ready_event.clear()
+        
+        # 启动后台线程
+        start_xtdata_thread()
+        
+        # 等待xtdata初始化完成
+        logger.info("等待xtdata初始化完成...")
+        if not xtdata_ready_event.wait(timeout=10):
+            logger.warning("等待xtdata初始化超时")
+        else:
+            logger.info("xtdata初始化完成")
+        
+        # 等待连接稳定
+        time.sleep(2)
+        
+        # 测试连接
+        test_code = "510050.SH"
+        try:
+            # 订阅行情
+            xtdata.subscribe_quote(test_code, period="1d", count=1)
+            time.sleep(1)
+            
+            # 获取基本信息
+            info = xtdata.get_instrument_detail(test_code)
+            if info:
+                logger.info(f"QMT行情连接正常，获取到{test_code}信息")
+                xtdata_initialized = True
+                return True
+            else:
+                logger.error("QMT行情连接异常，无法获取证券信息")
+                return False
+        except Exception as e:
+            logger.error(f"测试QMT连接状态异常: {str(e)}")
+            return False
+        
+    except ImportError as e:
+        logger.error(f"导入xtquant失败: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"初始化xtquant时发生未知异常: {str(e)}")
+        return False
+
+# 初始化xtquant
+initialize_xtquant()
+
+# 更新缓存的函数
+def update_cache(fund_code, period, data):
+    """更新市场数据缓存"""
+    cache_key = f"{fund_code}_{period}"
+    market_data_cache[cache_key] = data
+    last_update_time[cache_key] = time.time()
+    logger.info(f"更新缓存: {cache_key}, 数据条数: {len(data)}")
+
+# 从缓存获取数据
+def get_from_cache(fund_code, period):
+    """从缓存获取市场数据"""
+    cache_key = f"{fund_code}_{period}"
+    if cache_key in market_data_cache:
+        return market_data_cache[cache_key], last_update_time.get(cache_key, 0)
+    return None, 0
+
+# 添加SSE实时推送端点
+@market_api.route('/api/market/realtime-klines', methods=['GET'])
+def get_realtime_klines():
+    """
+    获取实时K线数据（Server-Sent Events）
+    参数:
+        fund_code: 基金代码
+        period: 周期 (1m, 5m, 15m, 30m, 60m, 1d)
+    返回:
+        实时K线数据流
+    """
+    fund_code = request.args.get('fund_code')
+    period = request.args.get('period', '1m')
+    
+    if not fund_code:
+        return jsonify({
+            'status': 'error',
+            'message': '基金代码不能为空'
+        }), 400
+    
+    # 添加市场后缀
+    if '.' not in fund_code:
+        if fund_code.startswith('159') or fund_code.startswith('16'):
+            fund_code = f"{fund_code}.SZ"
+        elif fund_code.startswith('5') or fund_code.startswith('1'):
+            fund_code = f"{fund_code}.SH"
+        else:
+            fund_code = f"{fund_code}.SZ"
+    
+    # 确保xtdata已初始化
+    if xtdata is None or not xtdata_initialized:
+        if not initialize_xtquant():
+            return jsonify({
+                'status': 'error',
+                'message': 'xtquant未初始化，无法获取行情数据'
+            }), 500
+    
+    # 下载并订阅数据
+    try:
+        xtdata.download_history_data(fund_code, period=period, incrementally=True)
+        xtdata.subscribe_quote(fund_code, period=period, count=300)
+    except Exception as e:
+        logger.error(f"订阅行情异常: {str(e)}")
+    
+    def generate():
+        """生成SSE数据流"""
+        last_sent = 0
+        while True:
+            try:
+                # 获取最新数据
+                klines = xtdata.get_market_data_ex(
+                    [],
+                    [fund_code],
+                    period,
+                    "",
+                    "",
+                    300,
+                    'none',
+                    True
+                )
+                
+                if klines and fund_code in klines:
+                    data = klines[fund_code]
+                    result = []
+                    
+                    # 处理数据
+                    for i in range(len(data['time'])):
+                        try:
+                            time_obj = data['time'][i]
+                            # 转换时间戳
+                            if isinstance(time_obj, (int, float)):
+                                dt = datetime.fromtimestamp(time_obj / 1000)
+                                time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                            elif hasattr(time_obj, 'strftime'):
+                                time_str = time_obj.strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                                time_str = str(time_obj)
+                            
+                            kline = {
+                                'time': time_str,
+                                'open': float(data['open'][i]) if 'open' in data and i < len(data['open']) else 0.0,
+                                'high': float(data['high'][i]) if 'high' in data and i < len(data['high']) else 0.0,
+                                'low': float(data['low'][i]) if 'low' in data and i < len(data['low']) else 0.0,
+                                'close': float(data['close'][i]) if 'close' in data and i < len(data['close']) else 0.0,
+                                'volume': float(data['volume'][i]) if 'volume' in data and i < len(data['volume']) else 0,
+                                'amount': float(data['amount'][i]) if 'amount' in data and i < len(data['amount']) else 0
+                            }
+                            result.append(kline)
+                        except Exception as e:
+                            logger.warning(f"处理数据时出错: {str(e)}")
+                    
+                    # 更新缓存
+                    update_cache(fund_code, period, result)
+                    
+                    # 只有当数据有变化时才发送
+                    current_time = time.time()
+                    if current_time - last_sent >= 1.0:  # 至少1秒发送一次
+                        last_sent = current_time
+                        data_json = json.dumps({
+                            'status': 'success',
+                            'data': result
+                        })
+                        yield f"data: {data_json}\n\n"
+            except Exception as e:
+                logger.error(f"生成SSE数据流异常: {str(e)}")
+            
+            time.sleep(1)  # 每秒更新一次
+    
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+            'Access-Control-Allow-Origin': '*'
+        }
+    )
+
+# 修改原有K线接口，优先使用缓存
+@market_api.route('/api/market/klines', methods=['GET'])
+def get_klines():
+    """
+    获取K线数据
+    参数:
+        fund_code: 基金代码
+        period: 周期 (1m, 5m, 15m, 30m, 60m, 1d, 1w, 1M)
+        start_date: 开始日期 (可选)
+        count: 获取数量 (可选，默认-1表示获取所有可用数据)
+        time_range: 时间范围 (可选，如'today'表示当天数据)
+        use_cache: 是否使用缓存 (可选，默认true)
+    返回:
+        K线数据列表
+    """
+    try:
+        # 检查xtdata是否已初始化
+        global xtdata
+        if xtdata is None or not xtdata_initialized:
+            if not initialize_xtquant():
+                return jsonify({
+                    'status': 'error',
+                    'message': 'xtquant未初始化，无法获取行情数据'
+                }), 500
+        
+        # 获取请求参数
+        fund_code = request.args.get('fund_code')
+        period = request.args.get('period', '1d')
+        start_date = request.args.get('start_date', '')
+        count = int(request.args.get('count', -1))
+        time_range = request.args.get('time_range', '')
+        use_cache = request.args.get('use_cache', 'true').lower() == 'true'
+        
+        if not fund_code:
+            return jsonify({
+                'status': 'error',
+                'message': '基金代码不能为空'
+            }), 400
+        
+        # 添加市场后缀
+        if '.' not in fund_code:
+            if fund_code.startswith('159') or fund_code.startswith('16'):
+                # 深交所ETF一般以159或16开头
+                fund_code = f"{fund_code}.SZ"
+            elif fund_code.startswith('5') or fund_code.startswith('1'):
+                # 上交所ETF一般以5或1开头
+                fund_code = f"{fund_code}.SH"
+            else:
+                # 其他情况默认为深交所
+                fund_code = f"{fund_code}.SZ"
+        
+        logger.info(f"获取K线数据: {fund_code}, 周期: {period}, 开始日期: {start_date}, 数量: {count}, 时间范围: {time_range}")
+        
+        # 尝试从缓存获取数据
+        if use_cache:
+            cached_data, cache_time = get_from_cache(fund_code, period)
+            if cached_data and time.time() - cache_time < 5:  # 缓存5秒内有效
+                logger.info(f"使用缓存数据: {fund_code}_{period}, 数据条数: {len(cached_data)}")
+                return jsonify({
+                    'status': 'success',
+                    'data': cached_data,
+                    'from_cache': True
+                })
+        
+        # 下载历史数据
+        try:
+            # 下载数据
+            download_result = xtdata.download_history_data(fund_code, period=period, incrementally=True)
+            logger.info(f"历史数据下载结果: {download_result}")
+            
+            # 订阅行情
+            xtdata.subscribe_quote(fund_code, period=period, count=count if count > 0 else 300)
+            
+            # 等待数据加载
+            wait_time = 3 if period in ['1m', '5m', '15m', '30m', '60m'] else 2
+            time.sleep(wait_time)
+            
+            # 获取K线数据
+            klines = xtdata.get_market_data_ex(
+                [],  # 空列表表示获取所有字段
+                [fund_code],  # 证券代码
+                period,  # 周期
+                "",  # 开始时间
+                "",  # 结束时间
+                count,  # 数量
+                'none',  # 不复权
+                True  # 填充空缺数据
+            )
+            
+            # 检查是否获取到数据
+            if not klines or fund_code not in klines or len(klines[fund_code].get('time', [])) == 0:
+                logger.error(f"未获取到 {fund_code} 的K线数据")
+                return jsonify({
+                    'status': 'error',
+                    'message': f'无法获取 {fund_code} 的行情数据'
+                }), 404
+            
+            # 转换数据格式
+            data = klines[fund_code]
+            result = []
+            
+            # 处理当天数据过滤
+            today_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # 确保数据按时间排序
+            time_data = []
+            for i in range(len(data['time'])):
+                try:
+                    time_obj = data['time'][i]
+                    # 转换时间戳
+                    if isinstance(time_obj, (int, float)):
+                        # 如果是时间戳（毫秒）
+                        dt = datetime.fromtimestamp(time_obj / 1000)
+                        time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    elif hasattr(time_obj, 'strftime'):
+                        # 如果是datetime对象
+                        time_str = time_obj.strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        # 其他情况，直接转为字符串
+                        time_str = str(time_obj)
+                    
+                    # 构建K线数据，确保数值类型正确
+                    kline = {
+                        'time': time_str,
+                        'open': float(data['open'][i]) if 'open' in data and i < len(data['open']) else 0.0,
+                        'high': float(data['high'][i]) if 'high' in data and i < len(data['high']) else 0.0,
+                        'low': float(data['low'][i]) if 'low' in data and i < len(data['low']) else 0.0,
+                        'close': float(data['close'][i]) if 'close' in data and i < len(data['close']) else 0.0,
+                        'volume': float(data['volume'][i]) if 'volume' in data and i < len(data['volume']) else 0,
+                        'amount': float(data['amount'][i]) if 'amount' in data and i < len(data['amount']) else 0
+                    }
+                    
+                    # 如果是请求当天数据，只返回当天的数据
+                    if time_range == 'today':
+                        if time_str.startswith(today_date):
+                            time_data.append((time_str, kline))
+                    else:
+                        time_data.append((time_str, kline))
+                except Exception as e:
+                    logger.warning(f"处理第{i}条数据时出错: {str(e)}")
+                    continue
+            
+            # 按时间排序
+            time_data.sort(key=lambda x: x[0])
+            result = [item[1] for item in time_data]
+            
+            # 检查是否有数据
+            if len(result) == 0 and time_range == 'today':
+                logger.warning(f"当天没有 {fund_code} 的数据")
+                # 返回所有数据，不过滤
+                time_data = []
+                for i in range(len(data['time'])):
+                    try:
+                        time_obj = data['time'][i]
+                        # 转换时间戳
+                        if isinstance(time_obj, (int, float)):
+                            dt = datetime.fromtimestamp(time_obj / 1000)
+                            time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                        elif hasattr(time_obj, 'strftime'):
+                            time_str = time_obj.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            time_str = str(time_obj)
+                        
+                        kline = {
+                            'time': time_str,
+                            'open': float(data['open'][i]) if 'open' in data and i < len(data['open']) else 0.0,
+                            'high': float(data['high'][i]) if 'high' in data and i < len(data['high']) else 0.0,
+                            'low': float(data['low'][i]) if 'low' in data and i < len(data['low']) else 0.0,
+                            'close': float(data['close'][i]) if 'close' in data and i < len(data['close']) else 0.0,
+                            'volume': float(data['volume'][i]) if 'volume' in data and i < len(data['volume']) else 0,
+                            'amount': float(data['amount'][i]) if 'amount' in data and i < len(data['amount']) else 0
+                        }
+                        time_data.append((time_str, kline))
+                    except Exception as e:
+                        logger.warning(f"处理第{i}条数据时出错: {str(e)}")
+                        continue
+                
+                # 按时间排序
+                time_data.sort(key=lambda x: x[0])
+                result = [item[1] for item in time_data]
+                
+                # 更新缓存
+                update_cache(fund_code, period, result)
+                
+                return jsonify({
+                    'status': 'success',
+                    'data': result,
+                    'message': '未获取到当日数据，返回历史数据'
+                })
+            
+            # 检查数据是否有波动
+            if len(result) > 1:
+                has_variation = False
+                first_price = result[0]['close']
+                for item in result[1:]:
+                    if abs(item['close'] - first_price) > 0.0001:  # 检测价格是否有变化
+                        has_variation = True
+                        break
+                
+                if not has_variation:
+                    logger.warning(f"数据没有波动，可能是行情数据问题")
+            
+            # 更新缓存
+            update_cache(fund_code, period, result)
+            
+            return jsonify({
+                'status': 'success',
+                'data': result
+            })
+        
+        except Exception as e:
+            logger.error(f"获取K线数据失败: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'status': 'error',
+                'message': f'获取K线数据失败: {str(e)}'
+            }), 500
+    
+    except Exception as e:
+        logger.error(f"获取K线数据异常: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'status': 'error',
+            'message': f'获取K线数据异常: {str(e)}'
+        }), 500
+
+@market_api.route('/api/market/qmt-status', methods=['GET'])
+def get_qmt_status():
+    """检查QMT连接状态"""
+    try:
+        # 检查xtdata是否已初始化
+        global xtdata
+        if xtdata is None or not xtdata_initialized:
+            if not initialize_xtquant():
+                return jsonify({
+                    'status': 'error',
+                    'message': 'xtquant未初始化'
+                }), 500
+        
+        # 测试连接
+        test_code = "510050.SH"
+        try:
+            # 订阅行情
+            xtdata.subscribe_quote(test_code, period="1d", count=1)
+            time.sleep(1)
+            
+            # 获取基本信息
+            info = xtdata.get_instrument_detail(test_code)
+            if info:
+                return jsonify({
+                    'status': 'success',
+                    'connected': True,
+                    'message': 'QMT行情连接正常'
+                })
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'connected': False,
+                    'message': 'QMT行情连接异常，无法获取证券信息'
+                }), 500
+        except Exception as e:
+            return jsonify({
+                'status': 'error',
+                'connected': False,
+                'message': f'QMT行情连接异常: {str(e)}'
+            }), 500
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'检查QMT状态异常: {str(e)}'
+        }), 500
+
+@market_api.route('/api/market/reinitialize-qmt', methods=['POST'])
+def reinitialize_qmt():
+    """重新初始化QMT连接"""
+    global xtdata, xtdata_initialized, xtdata_thread
+    
+    # 重置状态
+    xtdata_initialized = False
+    
+    # 重新初始化
+    if initialize_xtquant():
+        return jsonify({
+            'status': 'success',
+            'message': 'QMT连接重新初始化成功'
+        })
+    else:
+        return jsonify({
+            'status': 'error',
+            'message': 'QMT连接重新初始化失败'
+        }), 500 

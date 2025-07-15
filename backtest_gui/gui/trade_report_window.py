@@ -1,0 +1,530 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+交易报告窗口 - 显示配对交易记录
+"""
+import sys
+import pandas as pd
+from datetime import datetime
+import traceback
+
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QDateEdit, QTableWidget, QTableWidgetItem, QHeaderView,
+    QGroupBox, QFormLayout, QMessageBox, QApplication, QSplitter
+)
+from PyQt5.QtCore import Qt, QDate, pyqtSlot
+
+from backtest_gui.utils.trade_query import TradeQuery
+
+
+class TradeReportWindow(QMainWindow):
+    """交易报告窗口"""
+    
+    def __init__(self, db_connector=None):
+        """初始化交易报告窗口
+        
+        Args:
+            db_connector: 数据库连接器对象
+        """
+        super().__init__()
+        
+        self.db_connector = db_connector
+        self.trade_query = TradeQuery(db_connector)
+        
+        self.init_ui()
+        
+    def init_ui(self):
+        """初始化UI"""
+        # 设置窗口属性
+        self.setWindowTitle("交易报告")
+        self.resize(1200, 800)
+        
+        # 创建中央部件
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # 创建主布局
+        main_layout = QVBoxLayout(central_widget)
+        
+        # 创建查询条件区域
+        filter_group = QGroupBox("查询条件")
+        filter_layout = QFormLayout()
+        
+        # 基金选择
+        self.fund_combo = QComboBox()
+        self.fund_combo.setMinimumWidth(200)
+        filter_layout.addRow("基金:", self.fund_combo)
+        
+        # 策略选择
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.setMinimumWidth(200)
+        filter_layout.addRow("策略:", self.strategy_combo)
+        
+        # 日期范围
+        date_layout = QHBoxLayout()
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDate(QDate.currentDate().addMonths(-1))
+        
+        self.end_date_edit = QDateEdit()
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDate(QDate.currentDate())
+        
+        date_layout.addWidget(self.start_date_edit)
+        date_layout.addWidget(QLabel("至"))
+        date_layout.addWidget(self.end_date_edit)
+        date_layout.addStretch()
+        
+        filter_layout.addRow("日期范围:", date_layout)
+        
+        # 网格级别选择
+        self.level_combo = QComboBox()
+        self.level_combo.setMinimumWidth(100)
+        self.level_combo.addItem("全部", None)
+        for i in range(1, 21):
+            self.level_combo.addItem(f"级别 {i}", i)
+        filter_layout.addRow("网格级别:", self.level_combo)
+        
+        # 交易状态选择
+        self.status_combo = QComboBox()
+        self.status_combo.setMinimumWidth(100)
+        self.status_combo.addItem("全部", None)
+        self.status_combo.addItem("进行中", "进行中")
+        self.status_combo.addItem("已完成", "已完成")
+        filter_layout.addRow("交易状态:", self.status_combo)
+        
+        # 查询按钮
+        button_layout = QHBoxLayout()
+        self.query_button = QPushButton("查询")
+        self.query_button.clicked.connect(self.on_query_clicked)
+        button_layout.addStretch()
+        button_layout.addWidget(self.query_button)
+        filter_layout.addRow("", button_layout)
+        
+        filter_group.setLayout(filter_layout)
+        main_layout.addWidget(filter_group)
+        
+        # 创建分割器
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        
+        # 创建回测汇总表格
+        summary_group = QGroupBox("回测汇总")
+        summary_layout = QVBoxLayout()
+        self.summary_table = QTableWidget()
+        self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.summary_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.summary_table.setAlternatingRowColors(True)
+        self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.summary_table.horizontalHeader().setStretchLastSection(True)
+        self.summary_table.verticalHeader().setVisible(False)
+        self.summary_table.itemClicked.connect(self.on_summary_item_clicked)
+        summary_layout.addWidget(self.summary_table)
+        summary_group.setLayout(summary_layout)
+        
+        # 创建配对交易表格
+        trades_group = QGroupBox("配对交易记录")
+        trades_layout = QVBoxLayout()
+        self.trades_table = QTableWidget()
+        self.trades_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.trades_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.trades_table.setAlternatingRowColors(True)
+        self.trades_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.trades_table.horizontalHeader().setStretchLastSection(True)
+        self.trades_table.verticalHeader().setVisible(False)
+        trades_layout.addWidget(self.trades_table)
+        trades_group.setLayout(trades_layout)
+        
+        # 添加到分割器
+        splitter.addWidget(summary_group)
+        splitter.addWidget(trades_group)
+        splitter.setSizes([200, 600])
+        
+        # 添加到主布局
+        main_layout.addWidget(splitter)
+        
+        # 加载基金列表
+        self.load_fund_list()
+        
+        # 加载策略列表
+        self.load_strategy_list()
+        
+        # 连接信号
+        self.fund_combo.currentIndexChanged.connect(self.on_fund_changed)
+        
+    def load_fund_list(self):
+        """加载基金列表"""
+        try:
+            if not self.db_connector:
+                print("无法加载基金列表：数据库连接器未初始化")
+                return
+                
+            conn = self.db_connector.get_connection()
+            if not conn:
+                print("无法获取数据库连接")
+                return
+                
+            try:
+                cursor = conn.cursor()
+                
+                # 查询基金列表
+                cursor.execute("""
+                    SELECT DISTINCT fi.fund_code, fi.fund_name
+                    FROM fund_info fi
+                    JOIN backtest_results br ON fi.fund_code = br.stock_code
+                    ORDER BY fi.fund_code
+                """)
+                
+                # 获取结果
+                results = cursor.fetchall()
+                
+                # 清空下拉框
+                self.fund_combo.clear()
+                
+                # 添加"全部"选项
+                self.fund_combo.addItem("全部", None)
+                
+                # 添加基金列表
+                for fund_code, fund_name in results:
+                    display_text = f"{fund_code} - {fund_name}" if fund_name else fund_code
+                    self.fund_combo.addItem(display_text, fund_code)
+                
+                print(f"成功加载 {len(results)} 个基金")
+                
+            except Exception as e:
+                print(f"加载基金列表失败: {str(e)}")
+                traceback.print_exc()
+            finally:
+                if conn:
+                    self.db_connector.release_connection(conn)
+                    
+        except Exception as e:
+            print(f"加载基金列表过程中出错: {str(e)}")
+            traceback.print_exc()
+            
+    def load_strategy_list(self):
+        """加载策略列表"""
+        try:
+            if not self.db_connector:
+                print("无法加载策略列表：数据库连接器未初始化")
+                return
+                
+            conn = self.db_connector.get_connection()
+            if not conn:
+                print("无法获取数据库连接")
+                return
+                
+            try:
+                cursor = conn.cursor()
+                
+                # 查询策略列表
+                cursor.execute("""
+                    SELECT DISTINCT bs.id, bs.name
+                    FROM band_strategies bs
+                    JOIN backtest_results br ON bs.id = br.strategy_id
+                    ORDER BY bs.name
+                """)
+                
+                # 获取结果
+                results = cursor.fetchall()
+                
+                # 清空下拉框
+                self.strategy_combo.clear()
+                
+                # 添加"全部"选项
+                self.strategy_combo.addItem("全部", None)
+                
+                # 添加策略列表
+                for strategy_id, strategy_name in results:
+                    self.strategy_combo.addItem(strategy_name, strategy_id)
+                
+                print(f"成功加载 {len(results)} 个策略")
+                
+            except Exception as e:
+                print(f"加载策略列表失败: {str(e)}")
+                traceback.print_exc()
+            finally:
+                if conn:
+                    self.db_connector.release_connection(conn)
+                    
+        except Exception as e:
+            print(f"加载策略列表过程中出错: {str(e)}")
+            traceback.print_exc()
+            
+    def on_fund_changed(self, index):
+        """基金选择变化事件"""
+        # 如果选择了特定基金，可以加载该基金的网格级别
+        fund_code = self.fund_combo.currentData()
+        if fund_code:
+            self.load_grid_levels(fund_code)
+            
+    def load_grid_levels(self, fund_code):
+        """加载基金的网格级别配置"""
+        try:
+            # 查询网格级别配置
+            grid_levels = self.trade_query.get_grid_levels_for_fund(fund_code)
+            
+            if grid_levels is not None and not grid_levels.empty:
+                # 清空下拉框
+                self.level_combo.clear()
+                
+                # 添加"全部"选项
+                self.level_combo.addItem("全部", None)
+                
+                # 添加网格级别列表
+                for _, row in grid_levels.iterrows():
+                    level = row['level']
+                    grid_type = row['grid_type']
+                    buy_price = row['buy_price']
+                    sell_price = row['sell_price']
+                    display_text = f"级别 {level} ({grid_type}): 买入 {buy_price:.4f}, 卖出 {sell_price:.4f}"
+                    self.level_combo.addItem(display_text, level)
+                
+                print(f"成功加载 {len(grid_levels)} 个网格级别")
+            else:
+                # 恢复默认选项
+                self.level_combo.clear()
+                self.level_combo.addItem("全部", None)
+                for i in range(1, 21):
+                    self.level_combo.addItem(f"级别 {i}", i)
+                    
+        except Exception as e:
+            print(f"加载网格级别配置失败: {str(e)}")
+            traceback.print_exc()
+            
+    def on_query_clicked(self):
+        """查询按钮点击事件"""
+        try:
+            # 获取查询条件
+            fund_code = self.fund_combo.currentData()
+            strategy_id = self.strategy_combo.currentData()
+            start_date = self.start_date_edit.date().toString("yyyy-MM-dd")
+            end_date = self.end_date_edit.date().toString("yyyy-MM-dd")
+            level = self.level_combo.currentData()
+            status = self.status_combo.currentData()
+            
+            # 查询回测汇总
+            self.load_backtest_summary(fund_code, strategy_id, start_date, end_date)
+            
+            # 查询配对交易记录
+            self.load_paired_trades(fund_code, strategy_id, start_date, end_date, level, status)
+            
+        except Exception as e:
+            print(f"查询过程中出错: {str(e)}")
+            traceback.print_exc()
+            QMessageBox.warning(self, "查询错误", f"查询过程中发生错误: {str(e)}")
+            
+    def load_backtest_summary(self, fund_code=None, strategy_id=None, start_date=None, end_date=None, backtest_id=None):
+        """加载回测汇总信息"""
+        try:
+            # 查询回测汇总
+            summary_df = self.trade_query.get_backtest_summary(fund_code, strategy_id, start_date, end_date, backtest_id)
+            
+            if summary_df is not None and not summary_df.empty:
+                # 设置表格列数
+                self.summary_table.setColumnCount(10)
+                
+                # 设置表头
+                headers = ["回测ID", "基金代码", "基金名称", "策略名称", "开始日期", "结束日期", 
+                          "初始资金", "最终资金", "总收益", "收益率(%)"]
+                self.summary_table.setHorizontalHeaderLabels(headers)
+                
+                # 设置行数
+                self.summary_table.setRowCount(len(summary_df))
+                
+                # 填充数据
+                for i, (_, row) in enumerate(summary_df.iterrows()):
+                    # 回测ID
+                    self.summary_table.setItem(i, 0, QTableWidgetItem(str(row['id'])))
+                    
+                    # 基金代码
+                    self.summary_table.setItem(i, 1, QTableWidgetItem(str(row['stock_code'])))
+                    
+                    # 基金名称
+                    fund_name = row['fund_name'] if pd.notna(row['fund_name']) else ""
+                    self.summary_table.setItem(i, 2, QTableWidgetItem(fund_name))
+                    
+                    # 策略名称
+                    strategy_name = row['strategy_name'] if pd.notna(row['strategy_name']) else ""
+                    self.summary_table.setItem(i, 3, QTableWidgetItem(strategy_name))
+                    
+                    # 开始日期
+                    start_date = row['start_date'].strftime("%Y-%m-%d") if pd.notna(row['start_date']) else ""
+                    self.summary_table.setItem(i, 4, QTableWidgetItem(start_date))
+                    
+                    # 结束日期
+                    end_date = row['end_date'].strftime("%Y-%m-%d") if pd.notna(row['end_date']) else ""
+                    self.summary_table.setItem(i, 5, QTableWidgetItem(end_date))
+                    
+                    # 初始资金
+                    initial_capital = f"{float(row['initial_capital']):,.2f}" if pd.notna(row['initial_capital']) else "0.00"
+                    self.summary_table.setItem(i, 6, QTableWidgetItem(initial_capital))
+                    
+                    # 最终资金
+                    final_capital = f"{float(row['final_capital']):,.2f}" if pd.notna(row['final_capital']) else "0.00"
+                    self.summary_table.setItem(i, 7, QTableWidgetItem(final_capital))
+                    
+                    # 总收益
+                    total_profit = f"{float(row['total_profit']):,.2f}" if pd.notna(row['total_profit']) else "0.00"
+                    self.summary_table.setItem(i, 8, QTableWidgetItem(total_profit))
+                    
+                    # 收益率
+                    profit_rate = f"{float(row['total_profit_rate']):.2f}%" if pd.notna(row['total_profit_rate']) else "0.00%"
+                    self.summary_table.setItem(i, 9, QTableWidgetItem(profit_rate))
+                    
+                # 调整列宽
+                self.summary_table.resizeColumnsToContents()
+                
+                # 存储完整数据
+                self.summary_data = summary_df
+                
+                # 如果只有一行数据且指定了backtest_id，自动选中该行
+                if len(summary_df) == 1 and backtest_id:
+                    self.summary_table.selectRow(0)
+                
+            else:
+                # 清空表格
+                self.summary_table.setRowCount(0)
+                self.summary_data = None
+                QMessageBox.information(self, "查询结果", "未查询到回测汇总信息")
+                
+        except Exception as e:
+            print(f"加载回测汇总信息失败: {str(e)}")
+            traceback.print_exc()
+            QMessageBox.warning(self, "查询错误", f"加载回测汇总信息失败: {str(e)}")
+            
+    def load_paired_trades(self, fund_code=None, strategy_id=None, start_date=None, end_date=None, level=None, status=None, backtest_id=None):
+        """加载配对交易记录"""
+        try:
+            # 查询配对交易记录
+            trades_df = self.trade_query.get_paired_trades(fund_code, strategy_id, start_date, end_date, level, status)
+            
+            if trades_df is not None and not trades_df.empty:
+                # 如果指定了回测ID，过滤数据
+                if backtest_id:
+                    trades_df = trades_df[trades_df['backtest_id'] == backtest_id]
+                    
+                if trades_df.empty:
+                    # 清空表格
+                    self.trades_table.setRowCount(0)
+                    QMessageBox.information(self, "查询结果", "未查询到配对交易记录")
+                    return
+                
+                # 设置表格列数
+                self.trades_table.setColumnCount(14)
+                
+                # 设置表头
+                headers = ["交易ID", "级别", "网格类型", "买入时间", "买入价格", "买入数量", "买入金额",
+                          "卖出时间", "卖出价格", "卖出数量", "卖出金额", "波段收益", "收益率(%)", "状态"]
+                self.trades_table.setHorizontalHeaderLabels(headers)
+                
+                # 设置行数
+                self.trades_table.setRowCount(len(trades_df))
+                
+                # 填充数据
+                for i, (_, row) in enumerate(trades_df.iterrows()):
+                    # 交易ID
+                    self.trades_table.setItem(i, 0, QTableWidgetItem(str(row['id'])))
+                    
+                    # 级别
+                    self.trades_table.setItem(i, 1, QTableWidgetItem(str(row['level'])))
+                    
+                    # 网格类型
+                    grid_type = row['grid_type'] if pd.notna(row['grid_type']) else ""
+                    self.trades_table.setItem(i, 2, QTableWidgetItem(grid_type))
+                    
+                    # 买入时间
+                    buy_time = row['buy_time'].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(row['buy_time']) else ""
+                    self.trades_table.setItem(i, 3, QTableWidgetItem(buy_time))
+                    
+                    # 买入价格
+                    buy_price = f"{float(row['buy_price']):.4f}" if pd.notna(row['buy_price']) else ""
+                    self.trades_table.setItem(i, 4, QTableWidgetItem(buy_price))
+                    
+                    # 买入数量
+                    buy_amount = f"{int(row['buy_amount']):,}" if pd.notna(row['buy_amount']) else ""
+                    self.trades_table.setItem(i, 5, QTableWidgetItem(buy_amount))
+                    
+                    # 买入金额
+                    buy_value = f"{float(row['buy_value']):,.2f}" if pd.notna(row['buy_value']) else ""
+                    self.trades_table.setItem(i, 6, QTableWidgetItem(buy_value))
+                    
+                    # 卖出时间
+                    sell_time = row['sell_time'].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(row['sell_time']) else ""
+                    self.trades_table.setItem(i, 7, QTableWidgetItem(sell_time))
+                    
+                    # 卖出价格
+                    sell_price = f"{float(row['sell_price']):.4f}" if pd.notna(row['sell_price']) else ""
+                    self.trades_table.setItem(i, 8, QTableWidgetItem(sell_price))
+                    
+                    # 卖出数量
+                    sell_amount = f"{int(row['sell_amount']):,}" if pd.notna(row['sell_amount']) else ""
+                    self.trades_table.setItem(i, 9, QTableWidgetItem(sell_amount))
+                    
+                    # 卖出金额
+                    sell_value = f"{float(row['sell_value']):,.2f}" if pd.notna(row['sell_value']) else ""
+                    self.trades_table.setItem(i, 10, QTableWidgetItem(sell_value))
+                    
+                    # 波段收益
+                    band_profit = f"{float(row['band_profit']):,.2f}" if pd.notna(row['band_profit']) else ""
+                    self.trades_table.setItem(i, 11, QTableWidgetItem(band_profit))
+                    
+                    # 收益率
+                    band_profit_rate = f"{float(row['band_profit_rate']):.2f}%" if pd.notna(row['band_profit_rate']) else ""
+                    self.trades_table.setItem(i, 12, QTableWidgetItem(band_profit_rate))
+                    
+                    # 状态
+                    status = row['status'] if pd.notna(row['status']) else ""
+                    self.trades_table.setItem(i, 13, QTableWidgetItem(status))
+                    
+                # 调整列宽
+                self.trades_table.resizeColumnsToContents()
+                
+                # 存储完整数据
+                self.trades_data = trades_df
+                
+            else:
+                # 清空表格
+                self.trades_table.setRowCount(0)
+                self.trades_data = None
+                QMessageBox.information(self, "查询结果", "未查询到配对交易记录")
+                
+        except Exception as e:
+            print(f"加载配对交易记录失败: {str(e)}")
+            traceback.print_exc()
+            QMessageBox.warning(self, "查询错误", f"加载配对交易记录失败: {str(e)}")
+            
+    def on_summary_item_clicked(self, item):
+        """回测汇总表格项点击事件"""
+        try:
+            # 获取点击的行
+            row = item.row()
+            
+            # 获取回测ID
+            backtest_id = int(self.summary_table.item(row, 0).text())
+            
+            # 加载该回测的配对交易记录
+            self.load_paired_trades(backtest_id=backtest_id)
+            
+        except Exception as e:
+            print(f"处理表格点击事件失败: {str(e)}")
+            traceback.print_exc()
+
+
+# 测试代码
+if __name__ == "__main__":
+    from backtest_gui.db.database import Database
+    
+    app = QApplication(sys.argv)
+    
+    # 创建数据库连接
+    db = Database()
+    db.connect()
+    
+    # 创建交易报告窗口
+    window = TradeReportWindow(db)
+    window.show()
+    
+    sys.exit(app.exec_()) 

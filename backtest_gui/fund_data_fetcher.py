@@ -1,0 +1,2575 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+基金数据获取器
+专注于获取真实行情数据，解决GIL锁问题
+- 日线数据：直接通过API获取
+- 分钟线数据：通过独立进程获取，避免GIL锁问题
+"""
+
+import os
+import sys
+import json
+import traceback
+import platform
+import subprocess
+import datetime
+from datetime import datetime, timedelta  # 添加正确的导入
+import time  # 添加time模块导入
+import pandas as pd
+import numpy as np
+import threading
+import multiprocessing
+import random
+import requests
+import psycopg2
+from psycopg2 import extras  # 用于优化批量数据操作
+from PyQt5.QtCore import QThread, pyqtSignal, QObject
+from backtest_gui.utils.time_utils import convert_timestamp_to_datetime
+
+# 创建日志目录
+def setup_logger():
+    """设置简单的日志函数"""
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    def log_info(msg):
+        """记录信息"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] {msg}")
+        
+    def log_error(msg):
+        """记录错误"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] {msg}")
+    
+    return log_info, log_error
+
+# 设置日志
+log_info, log_error = setup_logger()
+
+try:
+    from backtest_gui.utils.qmt_path_finder import find_qmt_path
+except ImportError:
+    # 查找QMT路径函数
+    def find_qmt_path():
+        """寻找QMT的安装路径"""
+        possible_paths = [
+            r"D:\国金QMT交易端模拟\userdata_mini",
+            r"C:\国金QMT交易端模拟\userdata_mini",
+            r"D:\国金证券QMT交易端\userdata_mini",
+            r"C:\国金证券QMT交易端\userdata_mini",
+            r"C:\Program Files\国金证券QMT交易端\userdata_mini",
+            r"C:\Program Files (x86)\国金证券QMT交易端\userdata_mini",
+            r"C:\Program Files\国金QMT交易端模拟\userdata_mini",
+            r"C:\Program Files (x86)\国金QMT交易端模拟\userdata_mini",
+            r"C:\Users\Administrator\Desktop\国金QMT交易端模拟\userdata_mini",
+            r"C:\Users\Administrator\Desktop\国金证券QMT交易端\userdata_mini",
+            r"D:国金证券QMT交易端\bin.x64\..\userdata_mini",
+            r"D:国金证券QMT交易端\userdata_mini",
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                lib_paths = [
+                    os.path.join(path, 'lib', 'site-packages'),
+                    os.path.join(path, 'lib'),
+                    os.path.join(os.path.dirname(path), 'lib'),
+                    os.path.join(os.path.dirname(path), 'lib', 'site-packages'),
+                ]
+                
+                for lib_path in lib_paths:
+                    if os.path.exists(lib_path) and lib_path not in sys.path:
+                        print(f"找到QMT路径: {path}")
+                        print(f"添加库路径: {lib_path}")
+                        sys.path.insert(0, lib_path)
+                        return path
+        
+        print("未找到QMT路径，请确保已安装QMT交易端")
+        return None
+
+# 分钟线数据获取脚本，将被保存为单独的文件
+MINUTE_DATA_FETCHER_SCRIPT = """#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+\"\"\"
+分钟线数据获取器独立进程
+在独立进程中运行，避免GIL锁问题
+\"\"\"
+
+import os
+import sys
+import time
+import traceback
+import json
+from datetime import datetime, timedelta
+import pandas as pd
+from backtest_gui.utils.time_utils import convert_timestamp_to_datetime
+
+def find_qmt_path():
+    \"\"\"寻找QMT的安装路径\"\"\"
+    possible_paths = [
+        r"D:\\国金QMT交易端模拟\\userdata_mini",
+        r"C:\\国金QMT交易端模拟\\userdata_mini",
+        r"D:\\国金证券QMT交易端\\userdata_mini",
+        r"C:\\国金证券QMT交易端\\userdata_mini",
+        r"C:\\Program Files\\国金证券QMT交易端\\userdata_mini",
+        r"C:\\Program Files (x86)\\国金证券QMT交易端\\userdata_mini",
+        r"C:\\Program Files\\国金QMT交易端模拟\\userdata_mini",
+        r"C:\\Program Files (x86)\\国金QMT交易端模拟\\userdata_mini",
+        r"C:\\Users\\Administrator\\Desktop\\国金QMT交易端模拟\\userdata_mini",
+        r"C:\\Users\\Administrator\\Desktop\\国金证券QMT交易端\\userdata_mini",
+        r"D:国金证券QMT交易端\\bin.x64\\..\\userdata_mini",
+        r"D:国金证券QMT交易端\\userdata_mini",
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            lib_paths = [
+                os.path.join(path, 'lib', 'site-packages'),
+                os.path.join(path, 'lib'),
+                os.path.join(os.path.dirname(path), 'lib'),
+                os.path.join(os.path.dirname(path), 'lib', 'site-packages'),
+            ]
+            
+            for lib_path in lib_paths:
+                if os.path.exists(lib_path) and lib_path not in sys.path:
+                    print(f"找到QMT路径: {{path}}")
+                    print(f"添加库路径: {{lib_path}}")
+                    sys.path.insert(0, lib_path)
+                    return path
+    
+    print("未找到QMT路径，请确保已安装QMT交易端")
+    return None
+
+def fetch_minute_data(symbol, start_date, end_date, data_level, output_file):
+    \"\"\"获取分钟线数据\"\"\"
+    result = {{
+        "success": False,
+        "message": "",
+        "data_count": 0,
+        "output_file": output_file
+    }}
+    
+    try:
+        # 查找QMT路径
+        qmt_path = find_qmt_path()
+        if not qmt_path:
+            result["message"] = "未找到QMT路径"
+            return result
+        
+        # 导入xtquant库
+        try:
+            from xtquant import xtdata
+            print("成功导入xtquant库")
+        except ImportError as e:
+            result["message"] = f"导入xtquant库失败: {{str(e)}}"
+            return result
+        
+        # 连接服务器
+        try:
+            # 设置参数
+            if hasattr(xtdata, 'enable_hello'):
+                xtdata.enable_hello = False  # 不显示登录欢迎信息
+            
+            if hasattr(xtdata, 'enable_reconnect'):
+                xtdata.enable_reconnect = True  # 启用自动重连
+                
+            xtdata.connect()
+            time.sleep(1)
+            print("已连接到xtdata服务器")
+        except Exception as e:
+            result["message"] = f"连接服务器失败: {{str(e)}}"
+            return result
+        
+        # 尝试多种周期格式
+        period_mapping = {{
+            "MIN1": ["MIN1", "1min", "1m"],
+            "MIN5": ["MIN5", "5min", "5m"],
+            "MIN15": ["MIN15", "15min", "15m"],
+            "MIN30": ["MIN30", "30min", "30m"],
+            "MIN60": ["MIN60", "60min", "1h"],
+            "1d": ["1d", "day", "DAY", "1day"],
+        }}
+        
+        # 确定使用哪个周期格式
+        periods_to_try = [data_level]
+        if data_level in period_mapping:
+            periods_to_try = period_mapping[data_level]
+        elif any(data_level in values for values in period_mapping.values()):
+            for key, values in period_mapping.items():
+                if data_level in values:
+                    periods_to_try = [key] + [p for p in values if p != data_level]
+                    break
+        
+        # 下载历史数据 - 尝试多种周期格式
+        download_success = False
+        for period in periods_to_try:
+            try:
+                print(f"尝试下载 {{symbol}} 的 {{period}} 数据...")
+                xtdata.download_history_data(symbol, period=period, incrementally=True)
+                print(f"下载 {{symbol}} 的 {{period}} 数据完成")
+                download_success = True
+                break
+            except Exception as e:
+                print(f"下载 {{symbol}} 的 {{period}} 数据失败: {{str(e)}}")
+        
+        if not download_success:
+            print(f"警告: 所有周期格式的下载都失败，尝试继续获取数据")
+        
+        # 获取历史数据 - 尝试多种周期格式
+        fields = ['time', 'open', 'high', 'low', 'close', 'volume', 'amount']
+        history_data = None
+        
+        for period in periods_to_try:
+            try:
+                print(f"尝试获取 {{symbol}} 的 {{period}} 数据...")
+                data = xtdata.get_market_data_ex(fields, [symbol], period=period, start_time=start_date, end_time=end_date)
+                if data and symbol in data:
+                    history_data = data
+                    print(f"成功获取 {{symbol}} 的 {{period}} 数据")
+                    break
+            except Exception as e:
+                print(f"获取 {{symbol}} 的 {{period}} 数据失败: {{str(e)}}")
+        
+        # 处理数据
+        if history_data and symbol in history_data:
+            data = history_data[symbol]
+            df = pd.DataFrame(data)
+            if not df.empty:
+                # 保存到输出文件
+                df.to_csv(output_file, index=False)
+                result["success"] = True
+                result["message"] = f"成功获取 {{symbol}} 的 {{data_level}} 数据"
+                result["data_count"] = len(df)
+                print(f"成功获取 {{symbol}} 的 {{data_level}} 数据，共 {{len(df)}} 条记录，保存到 {{output_file}}")
+                return result
+        
+        result["message"] = f"未获取到 {{symbol}} 的 {{data_level}} 数据"
+        return result
+        
+    except Exception as e:
+        result["message"] = f"获取 {{symbol}} 的 {{data_level}} 数据异常: {{str(e)}}"
+        traceback.print_exc()
+        return result
+
+if __name__ == "__main__":
+    # 从命令行参数获取输入
+    if len(sys.argv) < 6:
+        print("Usage: python minute_data_fetcher.py <symbol> <start_date> <end_date> <data_level> <output_file>")
+        sys.exit(1)
+    
+    symbol = sys.argv[1]
+    start_date = sys.argv[2]
+    end_date = sys.argv[3]
+    data_level = sys.argv[4]
+    output_file = sys.argv[5]
+    
+    result = fetch_minute_data(symbol, start_date, end_date, data_level, output_file)
+    
+    # 输出结果为JSON
+    print(json.dumps(result))
+    
+    # 正常退出，返回状态码
+    sys.exit(0 if result["success"] else 1)
+"""
+
+class FundDataWorker(QThread):
+    """基金数据获取工作线程"""
+    
+    # 定义信号
+    progress_signal = pyqtSignal(int, int, str)  # 进度信号
+    completed_signal = pyqtSignal(bool, str, object)  # 完成信号(成功状态, 消息, 数据)
+    error_signal = pyqtSignal(str)  # 错误信号
+    
+    def __init__(self, symbol, data_level="1d", db_connection=None, save_to_db=True):
+        """初始化基金数据获取工作线程
+        
+        Args:
+            symbol: 股票代码，如"510300.SH"
+            data_level: 数据级别，如"1d", "MIN1", "MIN5"
+            db_connection: 数据库连接
+            save_to_db: 是否保存到数据库
+        """
+        super().__init__()
+        self.symbol = symbol
+        self.data_level = data_level
+        self.db_connection = db_connection
+        self.save_to_db = save_to_db
+        self.start_date = None
+        self.end_date = None
+        self._xtdata = None
+        self._initialize_xtdata()
+        
+    def _initialize_xtdata(self):
+        """初始化xtdata模块"""
+        try:
+            # 查找QMT路径
+            qmt_path = find_qmt_path()
+            if not qmt_path:
+                self.error_signal.emit("未找到QMT路径，请确保QMT已安装")
+                return False
+            
+            # 导入xtquant库
+            from xtquant import xtdata
+            
+            # 设置参数
+            if hasattr(xtdata, 'enable_hello'):
+                xtdata.enable_hello = False  # 不显示登录欢迎信息
+            
+            if hasattr(xtdata, 'enable_reconnect'):
+                xtdata.enable_reconnect = True  # 启用自动重连
+            
+            # 连接服务器
+            xtdata.connect()
+            time.sleep(1)
+            
+            self._xtdata = xtdata
+            return True
+        except Exception as e:
+            error_msg = f"初始化xtdata模块异常: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            self.error_signal.emit(error_msg)
+            return False
+    
+    def _get_fund_info(self):
+        """获取基金信息，包括上市日期等"""
+        try:
+            if not self._initialize_xtdata():
+                self.error_signal.emit("初始化行情API失败")
+                return None
+                
+            # 获取基金基本信息
+            fund_info = None
+            try:
+                fund_info = self._xtdata.get_instrument_detail(self.symbol)
+                
+                # 打印返回的基金信息
+                print(f"获取到基金信息: {self.symbol}")
+                if fund_info:
+                    print(f"基金信息内容: {fund_info}")
+                    # 检查是否有证券名称字段
+                    for key in ['InstrumentName', 'Name', 'DisplayName', 'SecurityName']:
+                        if key in fund_info and fund_info[key]:
+                            print(f"找到基金名称: {key} = {fund_info[key]}")
+                            # 发送信号，表明已获取到基金名称
+                            self.progress_signal.emit(20, 100, f"获取到基金名称: {fund_info[key]}")
+                            break
+            except Exception as e:
+                print(f"从API获取基金信息失败: {str(e)}")
+                traceback.print_exc()
+                fund_info = None
+            
+            # 如果未获取到基金信息或基金名称，尝试其他方法
+            has_valid_name = fund_info and any(key in fund_info and fund_info[key] for key in ['InstrumentName', 'Name', 'DisplayName', 'SecurityName'])
+            if not has_valid_name:
+                print(f"未获取到 {self.symbol} 的有效基金名称，尝试其他方法")
+                
+                # 尝试获取证券名称
+                try:
+                    # 尝试使用其他API获取证券名称
+                    if hasattr(self._xtdata, 'get_stock_list_in_sector'):
+                        print("尝试使用get_stock_list_in_sector获取证券列表...")
+                        stock_list = self._xtdata.get_stock_list_in_sector('沪深A股')
+                        if stock_list:
+                            print(f"获取到证券列表，共 {len(stock_list)} 条")
+                            for stock in stock_list:
+                                if isinstance(stock, dict) and 'stock_code' in stock:
+                                    # 比较不带后缀的代码
+                                    pure_symbol = self.symbol.split('.')[0] if '.' in self.symbol else self.symbol
+                                    if stock['stock_code'] == pure_symbol or stock['stock_code'] == self.symbol:
+                                        print(f"找到匹配的证券: {stock}")
+                                        # 创建或更新基金信息字典
+                                        if not fund_info:
+                                            fund_info = {}
+                                        
+                                        # 添加或更新名称字段
+                                        fund_info['SecurityName'] = stock.get('stock_name', self.symbol)
+                                        fund_info['Symbol'] = self.symbol
+                                        fund_info['SecurityType'] = stock.get('stock_type', '')
+                                        
+                                        print(f"从证券列表获取到基金名称: {fund_info['SecurityName']}")
+                                        self.progress_signal.emit(20, 100, f"获取到基金名称: {fund_info['SecurityName']}")
+                                        return fund_info
+                except Exception as e:
+                    print(f"尝试获取证券名称失败: {str(e)}")
+                    traceback.print_exc()
+                
+                # 如果仍然没有获取到基金信息，尝试从网络获取
+                try:
+                    web_fund_name = self._get_fund_name_from_web(self.symbol)
+                    if web_fund_name:
+                        print(f"从网络获取到基金名称: {web_fund_name}")
+                        self.progress_signal.emit(20, 100, f"从网络获取到基金名称: {web_fund_name}")
+                        
+                        # 创建或更新基金信息字典
+                        if not fund_info:
+                            fund_info = {}
+                        
+                        # 添加或更新名称字段
+                        fund_info['SecurityName'] = web_fund_name
+                        fund_info['Symbol'] = self.symbol
+                        
+                        return fund_info
+                except Exception as e:
+                    print(f"从网络获取基金名称失败: {str(e)}")
+                    traceback.print_exc()
+            
+            # 返回基金信息
+            return fund_info
+            
+        except Exception as e:
+            print(f"获取基金信息异常: {str(e)}")
+            traceback.print_exc()
+            return None
+            
+    def _get_fund_listing_date(self):
+        """获取基金上市日期"""
+        try:
+            fund_info = self._get_fund_info()
+            if not fund_info:
+                print(f"未获取到 {self.symbol} 的基金信息，无法获取上市日期")
+                return None
+                
+            # 获取上市日期
+            if 'OpenDate' in fund_info:
+                listing_date = fund_info['OpenDate']
+                if listing_date:
+                    # 转换为YYYYMMDD格式
+                    if isinstance(listing_date, datetime):
+                        listing_date = listing_date.strftime('%Y%m%d')
+                        print(f"获取到上市日期(datetime类型): {listing_date}")
+                        return listing_date
+                    elif isinstance(listing_date, str):
+                        # 尝试转换为标准格式
+                        try:
+                            # 解析不同格式的日期
+                            if '-' in listing_date:
+                                dt = datetime.strptime(listing_date, '%Y-%m-%d')
+                            elif '/' in listing_date:
+                                dt = datetime.strptime(listing_date, '%Y/%m/%d')
+                            else:
+                                # 尝试直接解析YYYYMMDD格式
+                                dt = datetime.strptime(listing_date, '%Y%m%d')
+                            listing_date = dt.strftime('%Y%m%d')
+                            print(f"获取到上市日期(字符串转换): {listing_date}")
+                            return listing_date
+                        except ValueError as e:
+                            print(f"无法解析上市日期: {listing_date}, 错误: {str(e)}")
+                    else:
+                        print(f"上市日期类型无法识别: {type(listing_date)}")
+                    
+            # 如果没有找到上市日期，尝试找其他日期字段
+            date_field_used = None
+            for key in ['CreateDate', 'ExpireDate', 'start_date', 'establish_date', 'issue_date']:
+                if key in fund_info and fund_info[key]:
+                    date_value = fund_info[key]
+                    try:
+                        if isinstance(date_value, datetime):
+                            date_str = date_value.strftime('%Y%m%d')
+                            date_field_used = key
+                            print(f"使用{key}作为上市日期: {date_str}")
+                            return date_str
+                        elif isinstance(date_value, str):
+                            # 尝试多种日期格式
+                            dt = None
+                            try:
+                                if '-' in date_value:
+                                    dt = datetime.strptime(date_value, '%Y-%m-%d')
+                                elif '/' in date_value:
+                                    dt = datetime.strptime(date_value, '%Y/%m/%d')
+                                elif len(date_value) == 8:
+                                    # 尝试直接解析YYYYMMDD格式
+                                    dt = datetime.strptime(date_value, '%Y%m%d')
+                                
+                                if dt:
+                                    date_str = dt.strftime('%Y%m%d')
+                                    date_field_used = key
+                                    print(f"使用{key}作为上市日期: {date_str}")
+                                    return date_str
+                            except ValueError as e:
+                                print(f"无法解析{key}日期值: {date_value}, 错误: {str(e)}")
+                    except Exception as e:
+                        print(f"处理{key}日期时出错: {str(e)}")
+                            
+            # 最后尝试查询历史数据中最早的日期
+            try:
+                self.progress_signal.emit(15, 100, f"正在查询 {self.symbol} 的历史数据以获取最早交易日期...")
+                fields = ['time']
+                # 获取一个较长时间范围的数据，取最早的交易日
+                earliest_date = (datetime.now() - timedelta(days=365*10)).strftime('%Y%m%d')  # 10年前
+                latest_date = datetime.now().strftime('%Y%m%d')
+                
+                print(f"尝试从历史数据中获取最早交易日期，范围: {earliest_date} - {latest_date}...")
+                data = self._xtdata.get_market_data_ex(fields, [self.symbol], period='day', 
+                                                    start_time=earliest_date, end_time=latest_date)
+                                                    
+                if data and self.symbol in data and 'time' in data[self.symbol]:
+                    # 获取第一条记录的时间
+                    times = data[self.symbol]['time']
+                    if times and len(times) > 0:
+                        earliest_time = min(times)
+                        if isinstance(earliest_time, (int, float)):
+                            # 如果是时间戳，转换为日期字符串
+                            earliest_date = datetime.fromtimestamp(earliest_time / 1000).strftime('%Y%m%d')
+                            print(f"从历史数据获取到最早交易日期: {earliest_date}")
+                            self.progress_signal.emit(18, 100, f"获取到最早交易日期: {earliest_date}")
+                            return earliest_date
+                        elif isinstance(earliest_time, str):
+                            # 如果是字符串，尝试转换为标准格式
+                            try:
+                                if '-' in earliest_time:
+                                    dt = datetime.strptime(earliest_time, '%Y-%m-%d')
+                                    earliest_date = dt.strftime('%Y%m%d')
+                                elif '/' in earliest_time:
+                                    dt = datetime.strptime(earliest_time, '%Y/%m/%d')
+                                    earliest_date = dt.strftime('%Y%m%d')
+                                else:
+                                    # 可能已经是YYYYMMDD格式
+                                    earliest_date = earliest_time
+                                
+                                print(f"从历史数据获取到最早交易日期: {earliest_date}")
+                                self.progress_signal.emit(18, 100, f"获取到最早交易日期: {earliest_date}")
+                                return earliest_date
+                            except ValueError:
+                                print(f"无法解析历史数据日期: {earliest_time}")
+                else:
+                    print(f"未能从历史数据中获取时间信息")
+            except Exception as e:
+                print(f"获取最早交易日期异常: {str(e)}")
+                traceback.print_exc()
+                
+            # 如果所有尝试都失败，则返回默认日期（5年前）
+            default_date = (datetime.now() - timedelta(days=365*5)).strftime('%Y%m%d')
+            print(f"未能获取 {self.symbol} 的上市日期，使用默认日期（5年前）: {default_date}")
+            self.progress_signal.emit(18, 100, f"使用默认上市日期: {default_date}")
+            return default_date
+        except Exception as e:
+            print(f"获取上市日期异常: {str(e)}")
+            traceback.print_exc()
+            # 返回默认日期（5年前）
+            default_date = (datetime.now() - timedelta(days=365*5)).strftime('%Y%m%d')
+            print(f"出现异常，使用默认日期（5年前）: {default_date}")
+            return default_date
+    
+    def set_date_range(self, start_date, end_date):
+        """设置日期范围
+        
+        Args:
+            start_date: 开始日期，格式"YYYYMMDD"
+            end_date: 结束日期，格式"YYYYMMDD"
+        """
+        self.start_date = start_date
+        self.end_date = end_date
+    
+    def run(self):
+        """线程执行的主要方法"""
+        try:
+            self.progress_signal.emit(0, 100, f"开始获取 {self.symbol} 的 {self.data_level} 数据...")
+            
+            # 初始化QMT行情API
+            if not self._initialize_xtdata():
+                self.error_signal.emit(f"初始化行情API失败")
+                return
+            
+            # 根据数据级别获取数据
+            if self.data_level in ['day', '1d', 'week', 'month']:
+                # 日线级别数据直接获取
+                df = self._get_daily_data()
+            else:
+                # 分钟级别数据通过单独进程获取，避免GIL锁
+                df = self._get_minute_data_via_subprocess()
+                
+            if df is None or len(df) == 0:
+                self.error_signal.emit(f"未获取到 {self.symbol} 的 {self.data_level} 数据")
+                return
+                
+            # 保存数据
+            print("\n" + "*"*50)
+            print(f"开始保存 {self.symbol} 的数据流程...")
+            print("*"*50)
+            
+            if self.save_to_db:
+                try:
+                    # 调用_save_data方法保存数据（它会调用_save_market_data_to_db）
+                    print(f"准备调用_save_data方法保存 {self.symbol} 的数据...")
+                    result = self._save_data(df)
+                    if result:
+                        self.progress_signal.emit(100, 100, f"成功获取并保存 {self.symbol} 的 {self.data_level} 数据，共 {len(df)} 条记录")
+                        self.completed_signal.emit(True, f"成功获取并保存数据，共{len(df)}条记录", df)
+                        return
+                    else:
+                        # 保存失败，但仍然返回数据
+                        self.progress_signal.emit(100, 100, f"获取数据成功但保存失败，共 {len(df)} 条记录")
+                        self.completed_signal.emit(False, f"获取数据成功但保存失败", df)
+                        return
+                except Exception as e:
+                    # 保存出错，但仍然返回数据
+                    error_msg = f"保存数据异常: {str(e)}"
+                    print(error_msg)
+                    traceback.print_exc()
+                    self.progress_signal.emit(100, 100, f"获取数据成功但保存失败: {str(e)}")
+                    self.completed_signal.emit(False, f"获取数据成功但保存失败: {str(e)}", df)
+                    return
+            
+            # 如果没有保存到数据库，直接返回数据
+            self.progress_signal.emit(100, 100, f"成功获取 {self.symbol} 的 {self.data_level} 数据，共 {len(df)} 条记录")
+            self.completed_signal.emit(True, f"成功获取数据，共{len(df)}条记录", df)
+            
+        except Exception as e:
+            error_msg = f"获取 {self.symbol} 数据异常: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            self.error_signal.emit(error_msg)
+            self.completed_signal.emit(False, error_msg, None)
+    
+    def _get_daily_data(self):
+        """获取日线数据"""
+        try:
+            self.progress_signal.emit(30, 100, f"获取 {self.symbol} 的 {self.data_level} 数据...")
+            
+            # 确保xtdata已初始化
+            if not self._initialize_xtdata():
+                self.error_signal.emit("初始化行情API失败")
+                return None
+            
+            # 首先尝试下载历史数据，这一步很关键
+            self.progress_signal.emit(40, 100, f"下载 {self.symbol} 的历史数据...")
+            try:
+                # 使用与hangqing.py完全相同的参数格式
+                # 根据文档，正确的周期格式应该是：
+                # 1m, 5m, 15m, 30m, 60m, 1d, 1w, 1mon
+                if self.data_level == "1min":
+                    period = "1m"  # 使用hangqing.py中使用的格式
+                elif self.data_level == "5min":
+                    period = "5m"
+                elif self.data_level == "15min":
+                    period = "15m"
+                elif self.data_level == "30min":
+                    period = "30m"
+                elif self.data_level == "60min" or self.data_level == "1h":
+                    period = "60m"
+                elif self.data_level == "day" or self.data_level == "1d":
+                    period = "1d"
+                elif self.data_level == "week":
+                    period = "1w"
+                elif self.data_level == "month":
+                    period = "1mon"
+                else:
+                    period = self.data_level
+                    
+                # 使用增量下载模式
+                                # 使用增量下载模式
+                self._xtdata.download_history_data(self.symbol, period=period, incrementally=True)
+                print(f"下载 {self.symbol} 的 {period} 数据完成")
+            except Exception as e:
+                print(f"下载历史数据失败: {str(e)}")
+                traceback.print_exc()
+            
+            # 等待下载完成
+            time.sleep(1)
+            
+                        # 获取市场数据
+            fields = ['time', 'open', 'high', 'low', 'close', 'volume', 'amount']
+            self.progress_signal.emit(50, 100, f"查询 {self.symbol} 的 {self.data_level} 数据...")
+            
+            try:
+                # 使用get_market_data_ex方法获取数据，与hangqing.py完全一致
+                # 使用日期范围而不是固定条数
+                market_data = self._xtdata.get_market_data_ex(
+                    fields, 
+                    [self.symbol], 
+                    period=period, 
+                    start_time=self.start_date, 
+                    end_time=self.end_date
+                )
+                
+                if market_data and self.symbol in market_data:
+                    data = market_data[self.symbol]
+                    
+                    # 转换为DataFrame
+                    df = pd.DataFrame(data)
+                    if not df.empty:
+                        print(f"成功获取 {self.symbol} 的 {period} 数据，共 {len(df)} 条记录")
+                        
+                        # 添加符号和周期列
+                        df['symbol'] = self.symbol
+                        df['freq'] = self.data_level
+                        
+                        # 添加正确的日期列
+                        if 'time' in df.columns:
+                            if isinstance(df['time'].iloc[0], (int, float)):
+                                # 时间戳格式转换为datetime，注意QMT返回的时间戳是毫秒级的
+                                # 将毫秒时间戳转换为秒级，再转换为datetime
+                                correct_dates = convert_timestamp_to_datetime(df['time'])
+                                # 确保直接赋值给date列
+                                df['date'] = correct_dates
+                                print(f"转换时间戳示例: {df['time'].iloc[0]} -> {df['date'].iloc[0]}")
+                        
+                        self.progress_signal.emit(100, 100, f"成功获取 {self.symbol} 的数据，共 {len(df)} 条记录")
+                        return df
+            except Exception as e:
+                print(f"使用get_market_data_ex获取数据失败: {str(e)}")
+                traceback.print_exc()
+                
+            # 如果上面的方法都失败，尝试使用订阅方式获取数据
+            try:
+                self.progress_signal.emit(60, 100, f"尝试订阅 {self.symbol} 的 {self.data_level} 数据...")
+                
+                # 向服务器订阅数据，参考hangqing.py的方式
+                # 使用上面已经转换好的period变量
+                self._xtdata.subscribe_quote(self.symbol, period=period, count=10)
+                
+                # 等待订阅完成
+                time.sleep(1)
+                
+                # 获取订阅后的行情，与hangqing.py完全一致
+                kline_data = self._xtdata.get_market_data_ex([], [self.symbol], period=period)
+                
+                if kline_data and self.symbol in kline_data:
+                    data = kline_data[self.symbol]
+                    
+                    # 转换为DataFrame
+                    df = pd.DataFrame(data)
+                    if not df.empty:
+                        print(f"通过订阅方式获取 {self.symbol} 的 {self.data_level} 数据，共 {len(df)} 条记录")
+                        
+                        # 添加符号和周期列
+                        df['symbol'] = self.symbol
+                        df['freq'] = self.data_level
+                        
+                        # 添加正确的日期列
+                        if 'time' in df.columns:
+                            if isinstance(df['time'].iloc[0], (int, float)):
+                                # 时间戳格式转换为datetime，注意QMT返回的时间戳是毫秒级的
+                                # 将毫秒时间戳转换为秒级，再转换为datetime
+                                df['date'] = convert_timestamp_to_datetime(df['time'])
+                                print(f"转换时间戳示例: {df['time'].iloc[0]} -> {df['date'].iloc[0]}")
+                        
+                        self.progress_signal.emit(80, 100, f"成功获取 {self.symbol} 的 {self.data_level} 数据，共 {len(df)} 条记录")
+                        return df
+            except Exception as e:
+                print(f"通过订阅方式获取数据失败: {str(e)}")
+                traceback.print_exc()
+                
+            # 如果所有方法都失败，返回错误
+            self.error_signal.emit(f"未能获取到 {self.symbol} 的数据")
+            return None
+            
+        except Exception as e:
+            error_msg = f"获取 {self.symbol} 的日线数据异常: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            self.error_signal.emit(error_msg)
+            return None
+            
+    def _get_minute_data_via_subprocess(self):
+        """通过子进程获取分钟线数据，避免GIL锁"""
+        try:
+            self.progress_signal.emit(30, 100, f"获取 {self.symbol} 的 {self.data_level} 数据...")
+            
+            # 尝试导入simple_fund_data_fetcher模块获取分钟线数据
+            print("尝试导入simple_fund_data_fetcher模块获取分钟线数据")
+            try:
+                # 先尝试直接导入模块
+                import simple_fund_data_fetcher
+                
+                # 创建一个SimpleFundDataFetcher实例
+                fetcher = simple_fund_data_fetcher.SimpleFundDataFetcher()
+                
+                # 使用getter连接信号
+                def on_progress(current, total, message):
+                    self.progress_signal.emit(current, total, message)
+                    
+                def on_completed(success, message, data):
+                    if success:
+                        print(f"成功获取数据: {message}")
+                    else:
+                        print(f"获取数据失败: {message}")
+                    
+                def on_error(message):
+                    print(f"错误: {message}")
+                
+                # 连接信号
+                fetcher.progress_signal.connect(on_progress)
+                fetcher.completed_signal.connect(on_completed)
+                fetcher.error_signal.connect(on_error)
+                
+                # 获取数据
+                simple_df = fetcher.get_fund_data(
+                    symbol=self.symbol, 
+                    start_date=self.start_date, 
+                    end_date=self.end_date, 
+                    data_level=self.data_level
+                )
+                
+                if simple_df is not None and not simple_df.empty:
+                    print(f"使用simple_fund_data_fetcher获取分钟线数据成功，共 {len(simple_df)} 条记录")
+                    return simple_df
+                else:
+                    print("使用simple_fund_data_fetcher获取分钟线数据失败，尝试其他方法")
+                    
+            except ImportError as e:
+                print(f"使用simple_fund_data_fetcher获取分钟线数据失败: {str(e)}")
+            except Exception as e:
+                print(f"使用simple_fund_data_fetcher获取分钟线数据失败: {str(e)}")
+                traceback.print_exc()
+            
+            # 参考hangqing.py的方式获取分钟线数据
+            self.progress_signal.emit(40, 100, f"下载 {self.symbol} 的历史数据...")
+            try:
+                # 先下载历史数据
+                # 使用与hangqing.py完全相同的参数格式
+                # 根据文档，正确的周期格式应该是：
+                # 1m, 5m, 15m, 30m, 60m, 1d, 1w, 1mon
+                if self.data_level == "1min":
+                    period = "1m"  # 使用hangqing.py中使用的格式
+                elif self.data_level == "5min":
+                    period = "5m"
+                elif self.data_level == "15min":
+                    period = "15m"
+                elif self.data_level == "30min":
+                    period = "30m"
+                elif self.data_level == "60min" or self.data_level == "1h":
+                    period = "60m"
+                elif self.data_level == "day" or self.data_level == "1d":
+                    period = "1d"
+                elif self.data_level == "week":
+                    period = "1w"
+                elif self.data_level == "month":
+                    period = "1mon"
+                else:
+                    period = self.data_level
+                        
+                                # 使用增量下载模式
+                self._xtdata.download_history_data(self.symbol, period=period, incrementally=True)
+                print(f"下载 {self.symbol} 的 {period} 数据完成")
+            except Exception as e:
+                print(f"下载历史数据失败: {str(e)}")
+                traceback.print_exc()
+            
+            # 等待下载完成
+            time.sleep(1)
+            
+                        # 获取市场数据
+            fields = ['time', 'open', 'high', 'low', 'close', 'volume', 'amount']
+            self.progress_signal.emit(50, 100, f"查询 {self.symbol} 的 {self.data_level} 数据...")
+            
+            try:
+                self.progress_signal.emit(60, 100, f"尝试订阅 {self.symbol} 的 {self.data_level} 数据...")
+                
+                # 向服务器订阅数据，与hangqing.py完全一致
+                # 使用上面已经转换好的period变量
+                self._xtdata.subscribe_quote(self.symbol, period=period, count=10)
+                
+                # 等待订阅完成
+                time.sleep(1)
+                
+                # 获取订阅后的行情，与hangqing.py完全一致
+                kline_data = self._xtdata.get_market_data_ex([], [self.symbol], period=period)
+                
+                if kline_data and self.symbol in kline_data:
+                    data = kline_data[self.symbol]
+                    
+                    # 转换为DataFrame
+                    df = pd.DataFrame(data)
+                    if not df.empty:
+                        print(f"通过订阅方式获取 {self.symbol} 的 {self.data_level} 数据，共 {len(df)} 条记录")
+                        
+                        # 添加符号和周期列
+                        df['symbol'] = self.symbol
+                        df['freq'] = self.data_level
+                        
+                        # 添加正确的日期列
+                        if 'time' in df.columns:
+                            if isinstance(df['time'].iloc[0], (int, float)):
+                                # 时间戳格式转换为datetime，注意QMT返回的时间戳是毫秒级的
+                                # 将毫秒时间戳转换为秒级，再转换为datetime
+                                df['date'] = convert_timestamp_to_datetime(df['time'])
+                                print(f"转换时间戳示例: {df['time'].iloc[0]} -> {df['date'].iloc[0]}")
+                        
+                        self.progress_signal.emit(80, 100, f"成功获取 {self.symbol} 的 {self.data_level} 数据，共 {len(df)} 条记录")
+                        return df
+            except Exception as e:
+                print(f"通过订阅方式获取分钟线数据失败: {str(e)}")
+                traceback.print_exc()
+            
+            # 如果上面的方法都失败，则返回空
+            self.error_signal.emit(f"未能获取到 {self.symbol} 的分钟线数据")
+            return None
+            
+        except Exception as e:
+            error_msg = f"获取 {self.symbol} 的分钟线数据异常: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            self.error_signal.emit(error_msg)
+            return None
+    
+    def _save_data(self, df):
+        """保存数据到数据库"""
+        try:
+            print("\n" + ">"*50)
+            print(f"_save_data方法被调用，准备保存 {self.symbol} 的数据...")
+            print(">"*50 + "\n")
+            
+            self.progress_signal.emit(80, 100, f"保存 {self.symbol} 的数据...")
+            
+            if df is None or df.empty:
+                self.error_signal.emit("没有数据可保存")
+                return False
+                
+            # 确保数据库已连接
+            from backtest_gui.db.database import Database
+            db = Database()
+            if not db.connect():
+                self.error_signal.emit("连接数据库失败")
+                return False
+            
+            # 获取基金信息并保存到fund_info表
+            try:
+                print("\n" + "="*50)
+                print(f"开始保存基金信息到数据库 - {self.symbol}")
+                print("="*50)
+                
+                # 提取基金代码（去掉.SH或.SZ后缀）
+                pure_code = self.symbol.split('.')[0] if '.' in self.symbol else self.symbol
+                
+                # 获取基金信息
+                fund_info = self._get_fund_info()
+                
+                # 提取基金名称
+                fund_name = None
+                if fund_info:
+                    for key in ['InstrumentName', 'Name', 'DisplayName', 'SecurityName']:
+                        if key in fund_info and fund_info[key]:
+                            fund_name = fund_info[key]
+                            print(f"从API获取到基金名称: {key} = {fund_name}")
+                            break
+                
+                # 如果从API获取不到，尝试从网络获取
+                if not fund_name or fund_name == self.symbol:
+                    print(f"尝试从网络获取基金名称: {self.symbol}")
+                    web_fund_name = self._get_fund_name_from_web(self.symbol)
+                    if web_fund_name:
+                        fund_name = web_fund_name
+                        print(f"从网络获取到基金名称: {fund_name}")
+                
+                # 如果仍然没有获取到基金名称，使用基金代码作为名称
+                if not fund_name:
+                    fund_name = self.symbol
+                    print(f"未能获取基金名称，使用基金代码作为名称: {fund_name}")
+                
+                # 提取上市日期
+                listing_date = self._get_fund_listing_date()
+                print(f"基金上市日期: {listing_date}")
+                
+                # 提取其他信息
+                fund_type = fund_info.get('SecurityType', '') if fund_info else ''
+                manager = fund_info.get('Manager', '') if fund_info else ''
+                company = fund_info.get('Company', '') if fund_info else ''
+                description = fund_info.get('Description', '') if fund_info else ''
+                
+                # 确保fund_name不是None
+                if fund_name is None:
+                    fund_name = self.symbol
+                
+                print(f"准备保存基金信息: {pure_code} - {fund_name}")
+                
+                # 保存到fund_info表
+                try:
+                    # 获取数据库连接
+                    conn = db.get_connection()
+                    if not conn:
+                        print("无法获取数据库连接")
+                        return False
+                        
+                    cursor = conn.cursor()
+                    
+                    # 查询是否已存在
+                    cursor.execute("SELECT fund_name FROM fund_info WHERE fund_code = %s", (pure_code,))
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        # 如果已存在，则更新
+                        print("\n>>> 正在更新基金信息...")
+                        update_query = """
+                        UPDATE fund_info 
+                        SET fund_name = %s, listing_date = %s, fund_type = %s, 
+                            manager = %s, company = %s, description = %s
+                        WHERE fund_code = %s
+                        """
+                        cursor.execute(update_query, (
+                            fund_name, 
+                            listing_date, 
+                            fund_type, 
+                            manager, 
+                            company, 
+                            description, 
+                            pure_code
+                        ))
+                        conn.commit()
+                        print(f"已更新基金信息: {pure_code} - {fund_name}")
+                    else:
+                        # 如果不存在，则插入
+                        print(f"数据库中不存在该基金信息，准备插入: {pure_code} - {fund_name}")
+                        print("\n>>> 正在执行插入基金信息到fund_info表...")
+                        insert_query = """
+                        INSERT INTO fund_info 
+                        (fund_code, fund_name, listing_date, fund_type, manager, company, description) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """
+                        cursor.execute(insert_query, (
+                            pure_code, 
+                            fund_name, 
+                            listing_date, 
+                            fund_type, 
+                            manager, 
+                            company, 
+                            description
+                        ))
+                        conn.commit()
+                        print(f"已保存基金信息: {pure_code} - {fund_name}")
+                    
+                    # 同时更新funds表，确保两表同步
+                    try:
+                        # 始终更新funds表中的名称
+                        print("\n>>> 正在更新funds表...")
+                        update_funds_query = """
+                        INSERT INTO funds (symbol, name) 
+                        VALUES (%s, %s)
+                        ON CONFLICT (symbol) DO UPDATE SET name = EXCLUDED.name
+                        """
+                        cursor.execute(update_funds_query, (self.symbol, fund_name))
+                        conn.commit()
+                        print(f"已更新funds表: {self.symbol} - {fund_name}")
+                    except Exception as e:
+                        print(f"更新funds表失败: {str(e)}")
+                        traceback.print_exc()
+                        
+                    # 关闭游标，释放连接
+                    cursor.close()
+                    db.release_connection(conn)
+                        
+                except Exception as e:
+                    print(f"保存基金信息失败: {str(e)}")
+                    traceback.print_exc()
+                
+                # 发送信号，表明基金信息已更新
+                self.progress_signal.emit(85, 100, f"已更新基金信息: {pure_code} - {fund_name}")
+                print("="*50)
+                print(f"基金信息保存完成 - {self.symbol}")
+                print("="*50 + "\n")
+            except Exception as e:
+                print(f"获取或保存基金信息失败: {str(e)}")
+                traceback.print_exc()
+            
+            # 检查数据类型
+            print(f"数据类型: {type(df)}")
+            print(f"列名: {df.columns.tolist()}")
+            print(f"数据示例:\n{df.head()}")
+            
+            # 检查并修复日期列，确保日期是正确的
+            if 'time' in df.columns:
+                print(f"time列类型: {df['time'].dtype}")
+                print(f"time列前5个值: {df['time'].head().tolist()}")
+                
+                # 确保time列是数值类型
+                try:
+                    if not pd.api.types.is_numeric_dtype(df['time']):
+                        print("time列不是数值类型，尝试转换...")
+                        df['time'] = pd.to_numeric(df['time'], errors='coerce')
+                        print(f"转换后time列类型: {df['time'].dtype}")
+                except Exception as e:
+                    print(f"转换time列类型失败: {str(e)}")
+                
+                # 检查time列是否有NaN值
+                if df['time'].isna().any():
+                    print(f"警告: time列有 {df['time'].isna().sum()} 个NaN值")
+                    # 填充NaN值
+                    df = df.dropna(subset=['time'])
+                    print(f"删除NaN后剩余记录数: {len(df)}")
+                
+                # 批量向量化处理时间戳，提高性能
+                print("开始批量转换时间戳...")
+                start_time = time.time()
+                
+                try:
+                    # 尝试直接使用pandas向量化操作
+                    # 时间戳通常是毫秒级，转换为秒级
+                    seconds = df['time'] / 1000
+                    # 使用pd.to_datetime进行批量转换
+                    df['date'] = pd.to_datetime(seconds, unit='s', utc=True).dt.tz_convert('Asia/Shanghai')
+                    
+                    # 如果数据量超过10万条，使用分批处理提高内存效率
+                    if len(df) > 100000:
+                        print(f"数据量超过10万条({len(df)}条)，使用分批处理...")
+                        batch_size = 50000
+                        total_batches = (len(df) + batch_size - 1) // batch_size
+                        dates = []
+                        
+                        for i in range(total_batches):
+                            start_idx = i * batch_size
+                            end_idx = min((i + 1) * batch_size, len(df))
+                            print(f"处理批次 {i+1}/{total_batches} ({start_idx}-{end_idx})...")
+                            
+                            batch_seconds = df['time'].iloc[start_idx:end_idx] / 1000
+                            batch_dates = pd.to_datetime(batch_seconds, unit='s', utc=True).dt.tz_convert('Asia/Shanghai')
+                            dates.append(batch_dates)
+                        
+                        df['date'] = pd.concat(dates)
+                except Exception as e:
+                    print(f"批量转换时间戳失败，回退到逐行处理: {str(e)}")
+                    traceback.print_exc()
+                    
+                    # 回退到逐行处理，但使用更高效的方式
+                    dates = []
+                    # 预先定义转换函数，避免重复查找
+                    convert_func = convert_timestamp_to_datetime
+                    # 提前获取列表，避免重复索引
+                    time_values = df['time'].tolist()
+                    
+                    for ts in time_values:
+                        try:
+                            date = convert_func(ts)
+                            if date is None:
+                                # 使用当前时间作为默认值
+                                date = pd.Timestamp.now()
+                            dates.append(date)
+                        except Exception:
+                            # 使用当前时间作为默认值
+                            dates.append(pd.Timestamp.now())
+                    
+                    # 批量赋值
+                    df['date'] = dates
+                
+                end_time = time.time()
+                print(f"时间戳转换完成，耗时: {end_time - start_time:.2f}秒")
+                print(f"date列前5个值: {[str(d) for d in df['date'].head().tolist()]}")
+            
+            # 添加symbol列(如果不存在)
+            if 'symbol' not in df.columns:
+                df['symbol'] = self.symbol
+                
+            # 添加freq列(如果不存在)
+            if 'freq' not in df.columns:
+                df['freq'] = self.data_level
+            
+            # 确保数据按日期排序
+            if 'date' in df.columns:
+                df = df.sort_values('date')
+            
+            # 提取基金代码（去掉后缀）
+            fund_code = self.symbol.split('.')[0]
+            
+            # 使用多线程保存数据
+            import concurrent.futures
+            from queue import Queue
+            import time as time_module  # 重命名time模块避免变量冲突
+            
+            total_rows = len(df)
+            self.progress_signal.emit(90, 100, f"正在多线程保存 {self.symbol} 的数据到数据库，共 {total_rows} 条记录...")
+            print(f"开始多线程保存数据到数据库，共 {total_rows} 条记录...")
+            
+            # 定义线程数
+            cpu_count = multiprocessing.cpu_count()
+            # 优化线程数：数据库操作是I/O密集型，可以使用稍多于CPU的线程数
+            # 使用1.5倍CPU核心数，但最少8个最多24个线程
+            num_threads = max(8, min(24, int(cpu_count * 1.5)))
+            print(f"系统CPU核心数: {cpu_count}, 使用 {num_threads} 个线程进行并行保存")
+            
+            # 分割数据
+            batch_size = 15000  # 每批处理的数据条数 (增大批次大小)
+            total_batches = (total_rows + batch_size - 1) // batch_size
+            
+            # 创建进度追踪变量
+            progress_queue = Queue()
+            processed_rows = 0
+            
+            # 定义线程工作函数
+            def save_batch(batch_df, batch_num):
+                """保存一批数据到数据库"""
+                conn = None
+                cursor = None
+                batch_results = {'inserted': 0, 'updated': 0, 'errors': 0, 'batch': batch_num}
+                
+                try:
+                    # 获取连接和游标
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    
+                    # 构建INSERT语句
+                    insert_sql = """
+                    INSERT INTO stock_quotes 
+                    (fund_code, data_level, date, time, open, high, low, close, volume, amount, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (fund_code, data_level, date) DO UPDATE SET
+                    time = EXCLUDED.time,
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    volume = EXCLUDED.volume,
+                    amount = EXCLUDED.amount,
+                    created_at = CURRENT_TIMESTAMP
+                    """
+                    
+                    # 优化：使用参数列表进行批量插入，替代逐行插入
+                    params_list = []
+                    try:
+                        for _, row in batch_df.iterrows():
+                            # 准备数据
+                            date_val = row['date'] if 'date' in row else None
+                            time_val = row['time'] if 'time' in row else None
+                            
+                            # 检查日期值是否有效
+                            if date_val is None:
+                                batch_results['errors'] += 1
+                                continue
+                            
+                            # 检查数值字段
+                            try:
+                                open_val = float(row['open'])
+                                high_val = float(row['high'])
+                                low_val = float(row['low'])
+                                close_val = float(row['close'])
+                                volume_val = float(row['volume'])
+                                amount_val = float(row['amount']) if 'amount' in row and not pd.isna(row['amount']) else 0.0
+                            except (ValueError, TypeError):
+                                batch_results['errors'] += 1
+                                continue
+                                
+                            params_list.append((
+                                fund_code, self.data_level, date_val, time_val, open_val, high_val, 
+                                low_val, close_val, volume_val, amount_val
+                            ))
+                    except Exception as e:
+                        print(f"参数准备过程中出错: {str(e)}")
+                        batch_results['errors'] += 1
+                    
+                    # 使用psycopg2.extras.execute_values进行高效批量插入
+                    if params_list:
+                        # 此处使用execute_values而不是executemany，性能更好
+                        extras.execute_values(
+                            cursor, 
+                            """
+                            INSERT INTO stock_quotes 
+                            (fund_code, data_level, date, time, open, high, low, close, volume, amount, created_at)
+                            VALUES %s
+                            ON CONFLICT (fund_code, data_level, date) DO UPDATE SET
+                            time = EXCLUDED.time,
+                            open = EXCLUDED.open,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            close = EXCLUDED.close,
+                            volume = EXCLUDED.volume,
+                            amount = EXCLUDED.amount,
+                            created_at = CURRENT_TIMESTAMP
+                            """,
+                            params_list,
+                            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)",
+                            page_size=1000  # 优化服务器端处理
+                        )
+                        
+                        conn.commit()
+                        
+                        # 更新结果统计
+                        batch_results['inserted'] = len(params_list)
+                    
+                except Exception as e:
+                    if conn:
+                        conn.rollback()
+                    print(f"批次 {batch_num} 保存失败: {str(e)}")
+                    batch_results['errors'] += len(batch_df)
+                finally:
+                    if cursor:
+                        cursor.close()
+                    if conn:
+                        db.release_connection(conn)
+                    
+                    # 更新进度
+                    progress_queue.put(batch_results)
+                    return batch_results
+            
+            # 开始多线程处理
+            start_time = time_module.time()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                # 提交所有批次任务
+                futures = []
+                for i in range(total_batches):
+                    start_idx = i * batch_size
+                    end_idx = min(start_idx + batch_size, total_rows)
+                    batch_df = df.iloc[start_idx:end_idx]
+                    futures.append(executor.submit(save_batch, batch_df, i+1))
+                
+                # 监控进度
+                total_inserted = 0
+                total_updated = 0
+                total_errors = 0
+                
+                # 显示实时进度
+                while processed_rows < total_rows:
+                    try:
+                        while not progress_queue.empty():
+                            result = progress_queue.get()
+                            processed_rows += result['inserted'] + result['updated'] + result['errors']
+                            total_inserted += result['inserted']
+                            total_updated += result['updated']
+                            total_errors += result['errors']
+                            
+                            # 更新进度
+                            progress = min(95, int(85 + 10 * processed_rows / total_rows))
+                            self.progress_signal.emit(progress, 100, 
+                                f"已处理 {processed_rows}/{total_rows} 条记录 (批次 {result['batch']}/{total_batches})")
+                            
+                            print(f"批次 {result['batch']}/{total_batches} 完成: 插入 {result['inserted']}, "
+                                  f"更新 {result['updated']}, 错误 {result['errors']}")
+                        
+                        time_module.sleep(0.1)  # 避免CPU占用过高
+                        
+                        # 检查是否所有任务都已完成
+                        if all(future.done() for future in futures):
+                            # 再次检查队列，确保所有结果都已处理
+                            while not progress_queue.empty():
+                                result = progress_queue.get()
+                                processed_rows += result['inserted'] + result['updated'] + result['errors']
+                                total_inserted += result['inserted']
+                                total_updated += result['updated']
+                                total_errors += result['errors']
+                            break
+                            
+                    except Exception as e:
+                        print(f"监控进度时出错: {str(e)}")
+            
+            # 所有线程完成
+            end_time = time_module.time()
+            execution_time = end_time - start_time
+            records_per_second = total_rows / execution_time if execution_time > 0 else 0
+            
+            print(f"\n多线程保存完成，总耗时: {execution_time:.2f}秒")
+            print(f"处理速度: {records_per_second:.2f}条/秒")
+            print(f"成功保存 {total_inserted} 条新记录和更新 {total_updated} 条记录，失败 {total_errors} 条")
+            
+            self.progress_signal.emit(100, 100, 
+                f"成功获取并保存 {self.symbol} 的 {self.data_level} 数据，共 {total_rows} 条记录")
+            
+            return total_errors == 0
+            
+        except Exception as e:
+            error_msg = f"保存数据到数据库时发生错误: {str(e)}"
+            self.error_signal.emit(error_msg)
+            print(error_msg)
+            traceback.print_exc()
+            return False
+
+    def _get_fund_name_from_web(self, symbol):
+        """从网络API获取基金名称
+        
+        Args:
+            symbol: 基金代码，格式如 '512480.SH'
+            
+        Returns:
+            str: 基金名称，如果获取失败则返回None
+        """
+        try:
+            # 提取纯代码
+            pure_code = symbol.split('.')[0] if '.' in symbol else symbol
+            
+            # 设置通用请求头和超时
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            timeout = 5  # 设置5秒超时
+            max_retries = 2  # 最大重试次数
+            
+            # 尝试从东方财富网获取基金名称
+            url = f"http://fundgz.1234567.com.cn/js/{pure_code}.js"
+            
+            print(f"尝试从东方财富网获取基金名称: {url}")
+            success = False
+            retry_count = 0
+            
+            while not success and retry_count <= max_retries:
+                try:
+                    response = requests.get(url, headers=headers, timeout=timeout)
+                    success = True
+                except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        print(f"请求东方财富网失败 ({retry_count}/{max_retries}): {str(e)}")
+                        break
+                    print(f"请求东方财富网超时，正在重试 ({retry_count}/{max_retries})...")
+                    time.sleep(1)  # 等待1秒后重试
+            
+            if success and response.status_code == 200:
+                # 返回格式通常是 jsonpgz({"fundcode":"512480","name":"半导体ETF",...})
+                content = response.text
+                print(f"获取到东方财富网响应: {content[:100]}...")
+                
+                # 提取JSON部分
+                if 'jsonpgz(' in content and ')' in content:
+                    try:
+                        json_str = content.split('jsonpgz(')[1].split(')')[0]
+                        data = json.loads(json_str)
+                        
+                        if 'name' in data and data['name']:
+                            fund_name = data['name']
+                            print(f"从东方财富网获取到基金名称: {fund_name}")
+                            return fund_name
+                    except (ValueError, json.JSONDecodeError) as e:
+                        print(f"解析东方财富网响应失败: {str(e)}")
+            
+            # 如果上面的方法失败，尝试另一个API
+            url = f"http://push2.eastmoney.com/api/qt/stock/get?secid=1.{pure_code}&ut=fa5fd1943c7b386f172d6893dbfba10b&fields=f57,f58,f107,f43,f59,f169,f170,f152,f46,f60,f44,f45,f168,f50,f47,f48,f49,f46,f169,f161,f117,f85,f47,f48,f163,f171,f113,f114,f115,f86,f117,f292"
+            
+            print(f"尝试从东方财富网API获取基金名称: {url}")
+            success = False
+            retry_count = 0
+            
+            while not success and retry_count <= max_retries:
+                try:
+                    response = requests.get(url, headers=headers, timeout=timeout)
+                    success = True
+                except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        print(f"请求东方财富网API失败 ({retry_count}/{max_retries}): {str(e)}")
+                        break
+                    print(f"请求东方财富网API超时，正在重试 ({retry_count}/{max_retries})...")
+                    time.sleep(1)  # 等待1秒后重试
+            
+            if success and response.status_code == 200:
+                try:
+                    data = response.json()
+                    print(f"获取到东方财富网API响应: {str(data)[:100]}...")
+                    
+                    if 'data' in data and 'f58' in data['data'] and data['data']['f58']:
+                        fund_name = data['data']['f58']
+                        print(f"从东方财富网API获取到基金名称: {fund_name}")
+                        return fund_name
+                except (ValueError, json.JSONDecodeError) as e:
+                    print(f"解析东方财富网API响应失败: {str(e)}")
+            
+            # 尝试从新浪财经获取
+            url = f"https://hq.sinajs.cn/list=sh{pure_code}"
+            if pure_code.startswith(('0', '3')):
+                url = f"https://hq.sinajs.cn/list=sz{pure_code}"
+                
+            print(f"尝试从新浪财经获取基金名称: {url}")
+            success = False
+            retry_count = 0
+            
+            while not success and retry_count <= max_retries:
+                try:
+                    response = requests.get(url, headers=headers, timeout=timeout)
+                    success = True
+                except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        print(f"请求新浪财经失败 ({retry_count}/{max_retries}): {str(e)}")
+                        break
+                    print(f"请求新浪财经超时，正在重试 ({retry_count}/{max_retries})...")
+                    time.sleep(1)  # 等待1秒后重试
+            
+            if success and response.status_code == 200:
+                content = response.text
+                print(f"获取到新浪财经响应: {content[:100]}...")
+                
+                # 解析新浪财经的响应格式
+                try:
+                    if 'hq_str_' in content and '=' in content and ',' in content:
+                        parts = content.split('=')[1].strip('"').split(',')
+                        if len(parts) > 0 and parts[0]:
+                            fund_name = parts[0]
+                            print(f"从新浪财经获取到基金名称: {fund_name}")
+                            return fund_name
+                except Exception as e:
+                    print(f"解析新浪财经响应失败: {str(e)}")
+            
+            # 尝试从腾讯财经获取
+            url = f"https://qt.gtimg.cn/q=sh{pure_code}"
+            if pure_code.startswith(('0', '3')):
+                url = f"https://qt.gtimg.cn/q=sz{pure_code}"
+                
+            print(f"尝试从腾讯财经获取基金名称: {url}")
+            success = False
+            retry_count = 0
+            
+            while not success and retry_count <= max_retries:
+                try:
+                    response = requests.get(url, headers=headers, timeout=timeout)
+                    success = True
+                except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        print(f"请求腾讯财经失败 ({retry_count}/{max_retries}): {str(e)}")
+                        break
+                    print(f"请求腾讯财经超时，正在重试 ({retry_count}/{max_retries})...")
+                    time.sleep(1)  # 等待1秒后重试
+            
+            if success and response.status_code == 200:
+                content = response.text
+                print(f"获取到腾讯财经响应: {content[:100]}...")
+                
+                # 解析腾讯财经的响应格式
+                try:
+                    if '~' in content:
+                        parts = content.split('~')
+                        if len(parts) > 1 and parts[1]:
+                            fund_name = parts[1]
+                            print(f"从腾讯财经获取到基金名称: {fund_name}")
+                            return fund_name
+                except Exception as e:
+                    print(f"解析腾讯财经响应失败: {str(e)}")
+            
+            print(f"无法从网络获取 {symbol} 的基金名称")
+            return None
+        except Exception as e:
+            print(f"从网络获取基金名称失败: {str(e)}")
+            traceback.print_exc()
+            return None
+
+class FundDataFetcher(QObject):
+    """基金数据获取器"""
+    
+    # 定义信号
+    progress_signal = pyqtSignal(int, int, str)  # 进度信号
+    completed_signal = pyqtSignal(bool, str, object)  # 完成信号(成功状态, 消息, 数据)
+    error_signal = pyqtSignal(str)  # 错误信号
+    
+    def __init__(self):
+        super().__init__()
+        self._worker = None
+        self._db_connection = None
+    
+    def set_db_connection(self, connection):
+        """设置数据库连接
+        
+        Args:
+            connection: 数据库连接对象
+        """
+        self._db_connection = connection
+    
+    def fetch_data(self, symbol, start_date=None, end_date=None, data_level="1d", save_to_db=True):
+        """获取基金数据
+        
+        Args:
+            symbol: 基金代码
+            start_date: 开始日期，默认为上市日期
+            end_date: 结束日期，默认为昨天
+            data_level: 数据级别，如'day', '1min'等
+            save_to_db: 是否保存到数据库
+            
+        Returns:
+            None: 数据将通过completed_signal返回
+        """
+        # 如果已有正在运行的线程，先取消
+        if hasattr(self, '_worker') and self._worker is not None:
+            if self._worker.isRunning():
+                self.close()
+                
+        # 规范化symbol
+        if len(symbol) == 6:
+            # 如果只有6位数字，尝试根据第一位判断添加SH/SZ前缀
+            first_digit = symbol[0]
+            if first_digit in ['5', '6', '9']:
+                full_symbol = symbol + '.SH'  
+            elif first_digit in ['0', '1', '2', '3']:
+                full_symbol = symbol + '.SZ' 
+            else:
+                full_symbol = symbol
+        else:
+            full_symbol = symbol
+            
+        # 创建工作线程
+        self._worker = FundDataWorker(
+            symbol=full_symbol,
+            data_level=data_level,
+            db_connection=self._db_connection,
+            save_to_db=save_to_db
+        )
+        
+        # 如果未提供开始日期，获取基金上市日期
+        if start_date is None:
+            self.progress_signal.emit(0, 100, f"获取 {full_symbol} 的上市日期...")
+            listing_date = self._worker._get_fund_listing_date()
+            if listing_date:
+                start_date = listing_date
+                self.progress_signal.emit(10, 100, f"获取到 {full_symbol} 的上市日期: {start_date}")
+            else:
+                # 如果获取失败，默认使用10年前的日期
+                start_date = (datetime.now() - timedelta(days=365*10)).strftime('%Y%m%d')
+                self.progress_signal.emit(10, 100, f"未获取到上市日期，使用默认日期: {start_date}")
+        
+        # 如果未提供结束日期，使用昨天的日期
+        if end_date is None:
+            end_date = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+            self.progress_signal.emit(15, 100, f"使用昨天作为结束日期: {end_date}")
+        
+        # 设置日期范围
+        self._worker.set_date_range(start_date, end_date)
+        
+        # 连接信号
+        self._worker.progress_signal.connect(self._on_progress)
+        self._worker.completed_signal.connect(self._on_completed)
+        self._worker.error_signal.connect(self._on_error)
+        
+        # 启动线程
+        self.progress_signal.emit(20, 100, f"正在获取 {full_symbol} 的 {data_level} 数据，日期范围: {start_date} - {end_date}...")
+        self._worker.start()
+        
+        return full_symbol
+    
+    def _on_progress(self, current, total, message):
+        """进度更新处理"""
+        self.progress_signal.emit(current, total, message)
+    
+    def _on_completed(self, success, message, data):
+        """完成处理"""
+        self.completed_signal.emit(success, message, data)
+    
+    def _on_error(self, message):
+        """错误处理"""
+        self.error_signal.emit(message)
+    
+    def close(self):
+        """关闭资源"""
+        if self._worker and self._worker.isRunning():
+            self._worker.terminate()
+            self._worker.wait()
+
+    def _initialize_xtdata(self, force=False):
+        """初始化行情API
+        
+        Args:
+            force: 是否强制重新初始化
+        
+        Returns:
+            bool: 是否成功初始化
+        """
+        try:
+            # 如果已初始化且不需要强制重新初始化，直接返回
+            if self._xtdata and not force:
+                return True
+                
+            # 初始化环境
+            self.progress_signal.emit(5, 100, "初始化行情API...")
+            
+            # 获取QMT路径
+            qmt_path = find_qmt_path()
+            if not qmt_path:
+                self.error_signal.emit("未找到QMT路径")
+                return False
+                
+            print(f"找到有效的QMT路径: {qmt_path}")
+            
+            # 添加QMT路径到系统路径
+            sys.path.append(qmt_path)
+            sys.path.append(os.path.join(qmt_path, "lib"))
+            sys.path.append(os.path.join(qmt_path, "bin"))
+            
+            # 检查可能的库路径
+            lib_paths = [
+                os.path.join(qmt_path, 'lib', 'site-packages'),
+                os.path.join(qmt_path, 'lib'),
+                os.path.join(os.path.dirname(qmt_path), 'lib'),
+                os.path.join(os.path.dirname(qmt_path), 'lib', 'site-packages'),
+            ]
+            
+            for lib_path in lib_paths:
+                if os.path.exists(lib_path) and lib_path not in sys.path:
+                    print(f"添加库路径: {lib_path}")
+                    sys.path.insert(0, lib_path)
+            
+            # 导入行情API
+            try:
+                # 确保每次都从xtquant导入最新的xtdata
+                import importlib
+                
+                # 尝试先删除可能存在的模块缓存
+                if 'xtquant.xtdata' in sys.modules:
+                    del sys.modules['xtquant.xtdata']
+                if 'xtdata' in sys.modules:
+                    del sys.modules['xtdata']
+                
+                # 导入xtdata模块
+                try:
+                    # 首先尝试从xtquant包导入
+                    from xtquant import xtdata
+                    print("从xtquant包导入xtdata模块成功")
+                except ImportError:
+                    # 如果失败，尝试直接导入
+                    import xtdata
+                    print("直接导入xtdata模块成功")
+                
+                # 参考hangqing.py的方式设置参数
+                if hasattr(xtdata, 'enable_hello'):
+                    xtdata.enable_hello = False  # 不显示登录欢迎信息
+                
+                if hasattr(xtdata, 'enable_reconnect'):
+                    xtdata.enable_reconnect = True  # 启用自动重连
+                
+                # 连接服务器
+                if hasattr(xtdata, 'connect'):
+                    xtdata.connect()
+                    print("连接到xtdata服务器")
+                    # 等待连接完成
+                    time.sleep(1)
+                
+                # 测试连接
+                try:
+                    # 尝试获取一些基本数据以测试连接
+                    code_list = ["515170.SH"]  # 测试用的ETF代码
+                    test_data = xtdata.get_market_data_ex([], code_list, period="1d", count=1)
+                    if test_data:
+                        print("成功测试连接，可以获取行情数据")
+                except Exception as e:
+                    print(f"测试连接失败，但继续初始化: {str(e)}")
+                
+                # 启动后台线程（如果需要）
+                if hasattr(xtdata, 'run'):
+                    print("启动xtdata后台线程")
+                    self._thread = threading.Thread(target=self._run_xtdata_background, args=(xtdata,), daemon=True)
+                    self._thread.start()
+                    time.sleep(1)  # 等待线程启动
+                
+                self._xtdata = xtdata
+                return True
+                
+            except ImportError as e:
+                error_msg = f"导入xtdata模块失败: {str(e)}"
+                print(error_msg)
+                self.error_signal.emit(error_msg)
+                return False
+                
+            except Exception as e:
+                error_msg = f"初始化xtdata异常: {str(e)}"
+                print(error_msg)
+                traceback.print_exc()
+                self.error_signal.emit(error_msg)
+                return False
+                
+        except Exception as e:
+            error_msg = f"初始化行情API异常: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            self.error_signal.emit(error_msg)
+            return False
+    
+    def _run_xtdata_background(self, xtdata):
+        """在后台线程中运行xtdata.run()"""
+        try:
+            xtdata.run()
+        except Exception as e:
+            print(f"xtdata.run()异常: {str(e)}")
+            traceback.print_exc()
+
+    def _get_fund_info(self):
+        """获取基金信息，包括上市日期等"""
+        try:
+            if not self._initialize_xtdata():
+                self.error_signal.emit("初始化行情API失败")
+                return None
+                
+            # 获取基金基本信息
+            fund_info = None
+            try:
+                fund_info = self._xtdata.get_instrument_detail(self.symbol)
+                
+                # 打印返回的基金信息
+                print(f"获取到基金信息: {self.symbol}")
+                if fund_info:
+                    print(f"基金信息内容: {fund_info}")
+                    # 检查是否有证券名称字段
+                    for key in ['InstrumentName', 'Name', 'DisplayName', 'SecurityName']:
+                        if key in fund_info and fund_info[key]:
+                            print(f"找到基金名称: {key} = {fund_info[key]}")
+                            # 发送信号，表明已获取到基金名称
+                            self.progress_signal.emit(20, 100, f"获取到基金名称: {fund_info[key]}")
+                            break
+            except Exception as e:
+                print(f"从API获取基金信息失败: {str(e)}")
+                traceback.print_exc()
+                fund_info = None
+            
+            # 如果未获取到基金信息或基金名称，尝试其他方法
+            has_valid_name = fund_info and any(key in fund_info and fund_info[key] for key in ['InstrumentName', 'Name', 'DisplayName', 'SecurityName'])
+            if not has_valid_name:
+                print(f"未获取到 {self.symbol} 的有效基金名称，尝试其他方法")
+                
+                # 尝试获取证券名称
+                try:
+                    # 尝试使用其他API获取证券名称
+                    if hasattr(self._xtdata, 'get_stock_list_in_sector'):
+                        print("尝试使用get_stock_list_in_sector获取证券列表...")
+                        stock_list = self._xtdata.get_stock_list_in_sector('沪深A股')
+                        if stock_list:
+                            print(f"获取到证券列表，共 {len(stock_list)} 条")
+                            for stock in stock_list:
+                                if isinstance(stock, dict) and 'stock_code' in stock:
+                                    # 比较不带后缀的代码
+                                    pure_symbol = self.symbol.split('.')[0] if '.' in self.symbol else self.symbol
+                                    if stock['stock_code'] == pure_symbol or stock['stock_code'] == self.symbol:
+                                        print(f"找到匹配的证券: {stock}")
+                                        # 创建或更新基金信息字典
+                                        if not fund_info:
+                                            fund_info = {}
+                                        
+                                        # 添加或更新名称字段
+                                        fund_info['SecurityName'] = stock.get('stock_name', self.symbol)
+                                        fund_info['Symbol'] = self.symbol
+                                        fund_info['SecurityType'] = stock.get('stock_type', '')
+                                        
+                                        print(f"从证券列表获取到基金名称: {fund_info['SecurityName']}")
+                                        self.progress_signal.emit(20, 100, f"获取到基金名称: {fund_info['SecurityName']}")
+                                        return fund_info
+                except Exception as e:
+                    print(f"尝试获取证券名称失败: {str(e)}")
+                    traceback.print_exc()
+                
+                # 如果仍然没有获取到基金信息，尝试从网络获取
+                try:
+                    web_fund_name = self._get_fund_name_from_web(self.symbol)
+                    if web_fund_name:
+                        print(f"从网络获取到基金名称: {web_fund_name}")
+                        self.progress_signal.emit(20, 100, f"从网络获取到基金名称: {web_fund_name}")
+                        
+                        # 创建或更新基金信息字典
+                        if not fund_info:
+                            fund_info = {}
+                        
+                        # 添加或更新名称字段
+                        fund_info['SecurityName'] = web_fund_name
+                        fund_info['Symbol'] = self.symbol
+                        
+                        return fund_info
+                except Exception as e:
+                    print(f"从网络获取基金名称失败: {str(e)}")
+                    traceback.print_exc()
+            
+            # 返回基金信息
+            return fund_info
+            
+        except Exception as e:
+            print(f"获取基金信息异常: {str(e)}")
+            traceback.print_exc()
+            return None
+            
+    def _get_fund_listing_date(self):
+        """获取基金上市日期"""
+        try:
+            fund_info = self._get_fund_info()
+            if not fund_info:
+                print(f"未获取到 {self.symbol} 的基金信息，无法获取上市日期")
+                return None
+                
+            # 获取上市日期
+            if 'OpenDate' in fund_info:
+                listing_date = fund_info['OpenDate']
+                if listing_date:
+                    # 转换为YYYYMMDD格式
+                    if isinstance(listing_date, datetime):
+                        listing_date = listing_date.strftime('%Y%m%d')
+                        print(f"获取到上市日期(datetime类型): {listing_date}")
+                        return listing_date
+                    elif isinstance(listing_date, str):
+                        # 尝试转换为标准格式
+                        try:
+                            # 解析不同格式的日期
+                            if '-' in listing_date:
+                                dt = datetime.strptime(listing_date, '%Y-%m-%d')
+                            elif '/' in listing_date:
+                                dt = datetime.strptime(listing_date, '%Y/%m/%d')
+                            else:
+                                # 尝试直接解析YYYYMMDD格式
+                                dt = datetime.strptime(listing_date, '%Y%m%d')
+                            listing_date = dt.strftime('%Y%m%d')
+                            print(f"获取到上市日期(字符串转换): {listing_date}")
+                            return listing_date
+                        except ValueError as e:
+                            print(f"无法解析上市日期: {listing_date}, 错误: {str(e)}")
+                    else:
+                        print(f"上市日期类型无法识别: {type(listing_date)}")
+                    
+            # 如果没有找到上市日期，尝试找其他日期字段
+            date_field_used = None
+            for key in ['CreateDate', 'ExpireDate', 'start_date', 'establish_date', 'issue_date']:
+                if key in fund_info and fund_info[key]:
+                    date_value = fund_info[key]
+                    try:
+                        if isinstance(date_value, datetime):
+                            date_str = date_value.strftime('%Y%m%d')
+                            date_field_used = key
+                            print(f"使用{key}作为上市日期: {date_str}")
+                            return date_str
+                        elif isinstance(date_value, str):
+                            # 尝试多种日期格式
+                            dt = None
+                            try:
+                                if '-' in date_value:
+                                    dt = datetime.strptime(date_value, '%Y-%m-%d')
+                                elif '/' in date_value:
+                                    dt = datetime.strptime(date_value, '%Y/%m/%d')
+                                elif len(date_value) == 8:
+                                    # 尝试直接解析YYYYMMDD格式
+                                    dt = datetime.strptime(date_value, '%Y%m%d')
+                                
+                                if dt:
+                                    date_str = dt.strftime('%Y%m%d')
+                                    date_field_used = key
+                                    print(f"使用{key}作为上市日期: {date_str}")
+                                    return date_str
+                            except ValueError as e:
+                                print(f"无法解析{key}日期值: {date_value}, 错误: {str(e)}")
+                    except Exception as e:
+                        print(f"处理{key}日期时出错: {str(e)}")
+                            
+            # 最后尝试查询历史数据中最早的日期
+            try:
+                self.progress_signal.emit(15, 100, f"正在查询 {self.symbol} 的历史数据以获取最早交易日期...")
+                fields = ['time']
+                # 获取一个较长时间范围的数据，取最早的交易日
+                earliest_date = (datetime.now() - timedelta(days=365*10)).strftime('%Y%m%d')  # 10年前
+                latest_date = datetime.now().strftime('%Y%m%d')
+                
+                print(f"尝试从历史数据中获取最早交易日期，范围: {earliest_date} - {latest_date}...")
+                data = self._xtdata.get_market_data_ex(fields, [self.symbol], period='day', 
+                                                    start_time=earliest_date, end_time=latest_date)
+                                                    
+                if data and self.symbol in data and 'time' in data[self.symbol]:
+                    # 获取第一条记录的时间
+                    times = data[self.symbol]['time']
+                    if times and len(times) > 0:
+                        earliest_time = min(times)
+                        if isinstance(earliest_time, (int, float)):
+                            # 如果是时间戳，转换为日期字符串
+                            earliest_date = datetime.fromtimestamp(earliest_time / 1000).strftime('%Y%m%d')
+                            print(f"从历史数据获取到最早交易日期: {earliest_date}")
+                            self.progress_signal.emit(18, 100, f"获取到最早交易日期: {earliest_date}")
+                            return earliest_date
+                        elif isinstance(earliest_time, str):
+                            # 如果是字符串，尝试转换为标准格式
+                            try:
+                                if '-' in earliest_time:
+                                    dt = datetime.strptime(earliest_time, '%Y-%m-%d')
+                                    earliest_date = dt.strftime('%Y%m%d')
+                                elif '/' in earliest_time:
+                                    dt = datetime.strptime(earliest_time, '%Y/%m/%d')
+                                    earliest_date = dt.strftime('%Y%m%d')
+                                else:
+                                    # 可能已经是YYYYMMDD格式
+                                    earliest_date = earliest_time
+                                
+                                print(f"从历史数据获取到最早交易日期: {earliest_date}")
+                                self.progress_signal.emit(18, 100, f"获取到最早交易日期: {earliest_date}")
+                                return earliest_date
+                            except ValueError:
+                                print(f"无法解析历史数据日期: {earliest_time}")
+                else:
+                    print(f"未能从历史数据中获取时间信息")
+            except Exception as e:
+                print(f"获取最早交易日期异常: {str(e)}")
+                traceback.print_exc()
+                
+            # 如果所有尝试都失败，则返回默认日期（5年前）
+            default_date = (datetime.now() - timedelta(days=365*5)).strftime('%Y%m%d')
+            print(f"未能获取 {self.symbol} 的上市日期，使用默认日期（5年前）: {default_date}")
+            self.progress_signal.emit(18, 100, f"使用默认上市日期: {default_date}")
+            return default_date
+        except Exception as e:
+            print(f"获取上市日期异常: {str(e)}")
+            traceback.print_exc()
+            # 返回默认日期（5年前）
+            default_date = (datetime.now() - timedelta(days=365*5)).strftime('%Y%m%d')
+            print(f"出现异常，使用默认日期（5年前）: {default_date}")
+            return default_date
+
+    def get_fund_data(self):
+        """获取基金数据"""
+        try:
+            # 格式化日期 
+            if self.start_date and len(self.start_date) == 8:
+                formatted_start = self.start_date
+            else:
+                formatted_start = datetime.now().strftime("%Y%m%d")
+            
+            if self.end_date and len(self.end_date) == 8:
+                formatted_end = self.end_date
+            else:
+                formatted_end = datetime.now().strftime("%Y%m%d")
+                
+            print(f"获取 {self.symbol} 数据，周期: {self.data_level}, 日期范围: {formatted_start}-{formatted_end}")
+            
+            # 根据数据级别选择不同的获取方法
+            if self.data_level in ['1d', 'day', 'DAY']:
+                data = self._get_daily_data()
+            else:
+                # 分钟数据使用子进程获取，避免GIL锁
+                data = self._get_minute_data_via_subprocess()
+            
+            # 检查是否成功获取数据
+            if data is None or data.empty:
+                self.error_signal.emit(f"未能获取到 {self.symbol} 的 {self.data_level} 数据")
+                return None
+            
+            # 处理数据，统一格式化时间列
+            if 'time' in data.columns:
+                # 检查时间格式，转换为datetime
+                if isinstance(data['time'].iloc[0], (int, float)):
+                    # 时间戳格式转换为日期时间，QMT返回的是毫秒级时间戳
+                    # 将毫秒时间戳转换为秒级，再转换为datetime
+                    data['date'] = convert_timestamp_to_datetime(data['time'])
+                    print(f"转换时间戳示例: {data['time'].iloc[0]} -> {data['date'].iloc[0]}")
+                else:
+                    # 尝试直接转换，确保正确处理时间戳
+                    data['date'] = convert_timestamp_to_datetime(data['time'])
+                
+                # 转换为所需格式的字符串
+                if self.data_level in ['1d', 'day', 'DAY']:
+                    data['date_str'] = data['date'].dt.strftime('%Y-%m-%d')
+                else:
+                    data['date_str'] = data['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # 保存数据到数据库
+            self._save_market_data_to_db(data)
+            
+            # 数据转换完成
+            self.progress_signal.emit(100, 100, f"完成 {self.symbol} 的 {self.data_level} 数据获取，共 {len(data)} 条记录")
+            self.completed_signal.emit(True, f"成功 - 成功获取数据，共{len(data)}条记录", data)
+            
+            return data
+            
+        except Exception as e:
+            error_msg = f"获取 {self.symbol} 的 {self.data_level} 数据异常: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            self.error_signal.emit(error_msg)
+            return None
+
+    def _save_market_data_to_db(self, df):
+        """保存市场数据到数据库
+        
+        Args:
+            df: 数据DataFrame
+        
+        Returns:
+            bool: 是否成功保存
+        """
+        try:
+            # 导入数据库模块
+            from backtest_gui.db.database import Database
+            
+            # 检查数据有效性
+            if df is None or len(df) == 0:
+                self.error_signal.emit(f"没有需要保存的数据")
+                return False
+                
+            # 初始化数据库
+            db = Database()
+            
+            # 优化：确保连接池设置足够处理多线程操作
+            # 重新配置连接池以提高性能
+            if hasattr(db, 'pool') and db.pool:
+                # 关闭旧连接池
+                db.pool.closeall()
+                
+                # 创建更大的连接池
+                db.pool = psycopg2.pool.SimpleConnectionPool(
+                    minconn=5,      # 最小连接数
+                    maxconn=32,     # 最大连接数 - 支持更多并发
+                    host=db.host,
+                    port=db.port,
+                    user=db.user,
+                    password=db.password,
+                    database=db.database
+                )
+                print(f"已优化数据库连接池设置: 最小连接数=5, 最大连接数=32")
+            
+            # 记录当前时间，用于计算性能
+            start_time_total = time.time()
+            
+            # 获取数据维度
+            print(f"数据类型: {type(df)}")
+            print(f"列名: {list(df.columns)}")
+            print(f"数据示例:")
+            print(df.head())
+            
+            # 获取基金信息并保存到fund_info表
+            try:
+                print("\n" + "="*50)
+                print(f"开始保存基金信息到数据库 - {self.symbol}")
+                print("="*50)
+                
+                # 提取基金代码（去掉.SH或.SZ后缀）
+                pure_code = self.symbol.split('.')[0] if '.' in self.symbol else self.symbol
+                
+                # 获取基金信息
+                fund_info = self._get_fund_info()
+                
+                # 提取基金名称
+                fund_name = None
+                if fund_info:
+                    for key in ['InstrumentName', 'Name', 'DisplayName', 'SecurityName']:
+                        if key in fund_info and fund_info[key]:
+                            fund_name = fund_info[key]
+                            print(f"从API获取到基金名称: {key} = {fund_name}")
+                            break
+                
+                # 如果从API获取不到，尝试从网络获取
+                if not fund_name or fund_name == self.symbol:
+                    print(f"尝试从网络获取基金名称: {self.symbol}")
+                    web_fund_name = self._get_fund_name_from_web(self.symbol)
+                    if web_fund_name:
+                        fund_name = web_fund_name
+                        print(f"从网络获取到基金名称: {fund_name}")
+                
+                # 如果仍然没有获取到基金名称，使用基金代码作为名称
+                if not fund_name:
+                    fund_name = self.symbol
+                    print(f"未能获取基金名称，使用基金代码作为名称: {fund_name}")
+                
+                # 提取上市日期
+                listing_date = self._get_fund_listing_date()
+                print(f"基金上市日期: {listing_date}")
+                
+                # 提取其他信息
+                fund_type = fund_info.get('SecurityType', '') if fund_info else ''
+                manager = fund_info.get('Manager', '') if fund_info else ''
+                company = fund_info.get('Company', '') if fund_info else ''
+                description = fund_info.get('Description', '') if fund_info else ''
+                
+                # 确保fund_name不是None
+                if fund_name is None:
+                    fund_name = self.symbol
+                
+                print(f"准备保存基金信息: {pure_code} - {fund_name}")
+                
+                # 保存到fund_info表
+                try:
+                    # 获取数据库连接
+                    conn = db.get_connection()
+                    if not conn:
+                        print("无法获取数据库连接")
+                        return False
+                        
+                    cursor = conn.cursor()
+                    
+                    # 查询是否已存在
+                    cursor.execute("SELECT fund_name FROM fund_info WHERE fund_code = %s", (pure_code,))
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        # 如果已存在，则更新
+                        print("\n>>> 正在更新基金信息...")
+                        update_query = """
+                        UPDATE fund_info 
+                        SET fund_name = %s, listing_date = %s, fund_type = %s, 
+                            manager = %s, company = %s, description = %s
+                        WHERE fund_code = %s
+                        """
+                        cursor.execute(update_query, (
+                            fund_name, 
+                            listing_date, 
+                            fund_type, 
+                            manager, 
+                            company, 
+                            description, 
+                            pure_code
+                        ))
+                        conn.commit()
+                        print(f"已更新基金信息: {pure_code} - {fund_name}")
+                    else:
+                        # 如果不存在，则插入
+                        print(f"数据库中不存在该基金信息，准备插入: {pure_code} - {fund_name}")
+                        print("\n>>> 正在执行插入基金信息到fund_info表...")
+                        insert_query = """
+                        INSERT INTO fund_info 
+                        (fund_code, fund_name, listing_date, fund_type, manager, company, description) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """
+                        cursor.execute(insert_query, (
+                            pure_code, 
+                            fund_name, 
+                            listing_date, 
+                            fund_type, 
+                            manager, 
+                            company, 
+                            description
+                        ))
+                        conn.commit()
+                        print(f"已保存基金信息: {pure_code} - {fund_name}")
+                    
+                    # 同时更新funds表，确保两表同步
+                    try:
+                        # 始终更新funds表中的名称
+                        print("\n>>> 正在更新funds表...")
+                        update_funds_query = """
+                        INSERT INTO funds (symbol, name) 
+                        VALUES (%s, %s)
+                        ON CONFLICT (symbol) DO UPDATE SET name = EXCLUDED.name
+                        """
+                        cursor.execute(update_funds_query, (self.symbol, fund_name))
+                        conn.commit()
+                        print(f"已更新funds表: {self.symbol} - {fund_name}")
+                    except Exception as e:
+                        print(f"更新funds表失败: {str(e)}")
+                        traceback.print_exc()
+                        
+                    # 关闭游标，释放连接
+                    cursor.close()
+                    db.release_connection(conn)
+                        
+                except Exception as e:
+                    print(f"保存基金信息失败: {str(e)}")
+                    traceback.print_exc()
+                
+                # 发送信号，表明基金信息已更新
+                self.progress_signal.emit(85, 100, f"已更新基金信息: {pure_code} - {fund_name}")
+                print("="*50)
+                print(f"基金信息保存完成 - {self.symbol}")
+                print("="*50 + "\n")
+            except Exception as e:
+                print(f"获取或保存基金信息失败: {str(e)}")
+                traceback.print_exc()
+            
+            # 检查数据类型
+            print(f"数据类型: {type(df)}")
+            print(f"列名: {df.columns.tolist()}")
+            print(f"数据示例:\n{df.head()}")
+            
+            # 检查并修复日期列，确保日期是正确的
+            if 'time' in df.columns:
+                print(f"time列类型: {df['time'].dtype}")
+                print(f"time列前5个值: {df['time'].head().tolist()}")
+                
+                # 确保time列是数值类型
+                try:
+                    if not pd.api.types.is_numeric_dtype(df['time']):
+                        print("time列不是数值类型，尝试转换...")
+                        df['time'] = pd.to_numeric(df['time'], errors='coerce')
+                        print(f"转换后time列类型: {df['time'].dtype}")
+                except Exception as e:
+                    print(f"转换time列类型失败: {str(e)}")
+                
+                # 检查time列是否有NaN值
+                if df['time'].isna().any():
+                    print(f"警告: time列有 {df['time'].isna().sum()} 个NaN值")
+                    # 填充NaN值
+                    df = df.dropna(subset=['time'])
+                    print(f"删除NaN后剩余记录数: {len(df)}")
+                
+                # 批量向量化处理时间戳，提高性能
+                print("开始批量转换时间戳...")
+                start_time = time.time()
+                
+                try:
+                    # 尝试直接使用pandas向量化操作
+                    # 时间戳通常是毫秒级，转换为秒级
+                    seconds = df['time'] / 1000
+                    # 使用pd.to_datetime进行批量转换
+                    df['date'] = pd.to_datetime(seconds, unit='s', utc=True).dt.tz_convert('Asia/Shanghai')
+                    
+                    # 如果数据量超过10万条，使用分批处理提高内存效率
+                    if len(df) > 100000:
+                        print(f"数据量超过10万条({len(df)}条)，使用分批处理...")
+                        batch_size = 50000
+                        total_batches = (len(df) + batch_size - 1) // batch_size
+                        dates = []
+                        
+                        for i in range(total_batches):
+                            start_idx = i * batch_size
+                            end_idx = min((i + 1) * batch_size, len(df))
+                            print(f"处理批次 {i+1}/{total_batches} ({start_idx}-{end_idx})...")
+                            
+                            batch_seconds = df['time'].iloc[start_idx:end_idx] / 1000
+                            batch_dates = pd.to_datetime(batch_seconds, unit='s', utc=True).dt.tz_convert('Asia/Shanghai')
+                            dates.append(batch_dates)
+                        
+                        df['date'] = pd.concat(dates)
+                except Exception as e:
+                    print(f"批量转换时间戳失败，回退到逐行处理: {str(e)}")
+                    traceback.print_exc()
+                    
+                    # 回退到逐行处理，但使用更高效的方式
+                    dates = []
+                    # 预先定义转换函数，避免重复查找
+                    convert_func = convert_timestamp_to_datetime
+                    # 提前获取列表，避免重复索引
+                    time_values = df['time'].tolist()
+                    
+                    for ts in time_values:
+                        try:
+                            date = convert_func(ts)
+                            if date is None:
+                                # 使用当前时间作为默认值
+                                date = pd.Timestamp.now()
+                            dates.append(date)
+                        except Exception:
+                            # 使用当前时间作为默认值
+                            dates.append(pd.Timestamp.now())
+                    
+                    # 批量赋值
+                    df['date'] = dates
+                
+                end_time = time.time()
+                print(f"时间戳转换完成，耗时: {end_time - start_time:.2f}秒")
+                print(f"date列前5个值: {[str(d) for d in df['date'].head().tolist()]}")
+            
+            # 添加symbol列(如果不存在)
+            if 'symbol' not in df.columns:
+                df['symbol'] = self.symbol
+                
+            # 添加freq列(如果不存在)
+            if 'freq' not in df.columns:
+                df['freq'] = self.data_level
+            
+            # 确保数据按日期排序
+            if 'date' in df.columns:
+                df = df.sort_values('date')
+            
+            # 提取基金代码（去掉后缀）
+            fund_code = self.symbol.split('.')[0]
+            
+            # 使用多线程保存数据
+            import concurrent.futures
+            from queue import Queue
+            import time
+            
+            total_rows = len(df)
+            self.progress_signal.emit(90, 100, f"正在多线程保存 {self.symbol} 的数据到数据库，共 {total_rows} 条记录...")
+            print(f"开始多线程保存数据到数据库，共 {total_rows} 条记录...")
+            
+            # 定义线程数
+            cpu_count = multiprocessing.cpu_count()
+            # 优化线程数：数据库操作是I/O密集型，可以使用稍多于CPU的线程数
+            # 使用1.5倍CPU核心数，但最少8个最多24个线程
+            num_threads = max(8, min(24, int(cpu_count * 1.5)))
+            print(f"系统CPU核心数: {cpu_count}, 使用 {num_threads} 个线程进行并行保存")
+            
+            # 分割数据
+            batch_size = 15000  # 每批处理的数据条数 (增大批次大小)
+            total_batches = (total_rows + batch_size - 1) // batch_size
+            
+            # 创建进度追踪变量
+            progress_queue = Queue()
+            processed_rows = 0
+            
+            # 定义线程工作函数
+            def save_batch(batch_df, batch_num):
+                """保存一批数据到数据库"""
+                conn = None
+                cursor = None
+                batch_results = {'inserted': 0, 'updated': 0, 'errors': 0, 'batch': batch_num}
+                
+                try:
+                    # 获取连接和游标
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    
+                    # 构建INSERT语句
+                    insert_sql = """
+                    INSERT INTO stock_quotes 
+                    (fund_code, data_level, date, time, open, high, low, close, volume, amount, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (fund_code, data_level, date) DO UPDATE SET
+                    time = EXCLUDED.time,
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    volume = EXCLUDED.volume,
+                    amount = EXCLUDED.amount,
+                    created_at = CURRENT_TIMESTAMP
+                    """
+                    
+                    # 优化：使用参数列表进行批量插入，替代逐行插入
+                    params_list = []
+                    try:
+                        for _, row in batch_df.iterrows():
+                            # 准备数据
+                            date_val = row['date'] if 'date' in row else None
+                            time_val = row['time'] if 'time' in row else None
+                            
+                            # 检查日期值是否有效
+                            if date_val is None:
+                                batch_results['errors'] += 1
+                                continue
+                            
+                            # 检查数值字段
+                            try:
+                                open_val = float(row['open'])
+                                high_val = float(row['high'])
+                                low_val = float(row['low'])
+                                close_val = float(row['close'])
+                                volume_val = float(row['volume'])
+                                amount_val = float(row['amount']) if 'amount' in row and not pd.isna(row['amount']) else 0.0
+                            except (ValueError, TypeError):
+                                batch_results['errors'] += 1
+                                continue
+                                
+                            params_list.append((
+                                fund_code, self.data_level, date_val, time_val, open_val, high_val, 
+                                low_val, close_val, volume_val, amount_val
+                            ))
+                    except Exception as e:
+                        print(f"参数准备过程中出错: {str(e)}")
+                        batch_results['errors'] += 1
+                    
+                    # 使用psycopg2.extras.execute_values进行高效批量插入
+                    if params_list:
+                        # 此处使用execute_values而不是executemany，性能更好
+                        extras.execute_values(
+                            cursor, 
+                            """
+                            INSERT INTO stock_quotes 
+                            (fund_code, data_level, date, time, open, high, low, close, volume, amount, created_at)
+                            VALUES %s
+                            ON CONFLICT (fund_code, data_level, date) DO UPDATE SET
+                            time = EXCLUDED.time,
+                            open = EXCLUDED.open,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            close = EXCLUDED.close,
+                            volume = EXCLUDED.volume,
+                            amount = EXCLUDED.amount,
+                            created_at = CURRENT_TIMESTAMP
+                            """,
+                            params_list,
+                            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)",
+                            page_size=1000  # 优化服务器端处理
+                        )
+                        
+                        conn.commit()
+                        
+                        # 更新结果统计
+                        batch_results['inserted'] = len(params_list)
+                    
+                except Exception as e:
+                    if conn:
+                        conn.rollback()
+                    print(f"批次 {batch_num} 保存失败: {str(e)}")
+                    batch_results['errors'] += len(batch_df)
+                finally:
+                    if cursor:
+                        cursor.close()
+                    if conn:
+                        db.release_connection(conn)
+                    
+                    # 更新进度
+                    progress_queue.put(batch_results)
+                    return batch_results
+            
+            # 开始多线程处理
+            start_time = time.time()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                # 提交所有批次任务
+                futures = []
+                for i in range(total_batches):
+                    start_idx = i * batch_size
+                    end_idx = min(start_idx + batch_size, total_rows)
+                    batch_df = df.iloc[start_idx:end_idx]
+                    futures.append(executor.submit(save_batch, batch_df, i+1))
+                
+                # 监控进度
+                total_inserted = 0
+                total_updated = 0
+                total_errors = 0
+                
+                # 显示实时进度
+                while processed_rows < total_rows:
+                    try:
+                        while not progress_queue.empty():
+                            result = progress_queue.get()
+                            processed_rows += result['inserted'] + result['updated'] + result['errors']
+                            total_inserted += result['inserted']
+                            total_updated += result['updated']
+                            total_errors += result['errors']
+                            
+                            # 更新进度
+                            progress = min(95, int(85 + 10 * processed_rows / total_rows))
+                            self.progress_signal.emit(progress, 100, 
+                                f"已处理 {processed_rows}/{total_rows} 条记录 (批次 {result['batch']}/{total_batches})")
+                            
+                            print(f"批次 {result['batch']}/{total_batches} 完成: 插入 {result['inserted']}, "
+                                  f"更新 {result['updated']}, 错误 {result['errors']}")
+                        
+                        time.sleep(0.1)  # 避免CPU占用过高
+                        
+                        # 检查是否所有任务都已完成
+                        if all(future.done() for future in futures):
+                            # 再次检查队列，确保所有结果都已处理
+                            while not progress_queue.empty():
+                                result = progress_queue.get()
+                                processed_rows += result['inserted'] + result['updated'] + result['errors']
+                                total_inserted += result['inserted']
+                                total_updated += result['updated']
+                                total_errors += result['errors']
+                            break
+                            
+                    except Exception as e:
+                        print(f"监控进度时出错: {str(e)}")
+            
+            # 所有线程完成
+            end_time = time.time()
+            execution_time = end_time - start_time
+            records_per_second = total_rows / execution_time if execution_time > 0 else 0
+            
+            print(f"\n多线程保存完成，总耗时: {execution_time:.2f}秒")
+            print(f"处理速度: {records_per_second:.2f}条/秒")
+            print(f"成功保存 {total_inserted} 条新记录和更新 {total_updated} 条记录，失败 {total_errors} 条")
+            
+            self.progress_signal.emit(100, 100, 
+                f"成功获取并保存 {self.symbol} 的 {self.data_level} 数据，共 {total_rows} 条记录")
+            
+            return total_errors == 0
+            
+        except Exception as e:
+            error_msg = f"保存数据到数据库时发生错误: {str(e)}"
+            self.error_signal.emit(error_msg)
+            print(error_msg)
+            traceback.print_exc()
+            return False
+
+# 测试函数
+def test_fund_data_fetcher():
+    """测试基金数据获取器"""
+    from PyQt5.QtCore import QCoreApplication
+    import sys
+    
+    # 创建应用
+    app = QCoreApplication(sys.argv)
+    
+    # 创建数据获取器
+    fetcher = FundDataFetcher()
+    
+    # 设置信号处理函数
+    def on_progress(current, total, message):
+        print(f"进度: {current}/{total} - {message}")
+    
+    def on_completed(success, message, data):
+        print(f"完成: {'成功' if success else '失败'} - {message}" + (f" (数据记录数: {len(data)})" if data is not None else ""))
+        if data is not None:
+            print(data.head())
+        
+        # 关闭应用
+        app.quit()
+    
+    def on_error(message):
+        print(f"错误: {message}")
+        app.quit()
+    
+    fetcher.progress_signal.connect(on_progress)
+    fetcher.completed_signal.connect(on_completed)
+    fetcher.error_signal.connect(on_error)
+    
+    # 测试获取数据
+    symbol = "510300.SH"  # 沪深300ETF
+    fetcher.fetch_data(symbol, data_level="1d", save_to_db=True)  # 修改为True，测试保存到数据库
+    
+    # 运行应用
+    sys.exit(app.exec_())
+
+# 主函数
+if __name__ == "__main__":
+    test_fund_data_fetcher() 
