@@ -24,13 +24,6 @@ try:
 except ImportError:
     from backtest_gui.utils.xirr_calculator_simple import XIRRCalculatorSimple as XIRRCalculator
 
-# 导入交易专用XIRR计算器
-try:
-    from backtest_gui.utils.xirr_calculator_trades_only import XIRRCalculatorTradesOnly
-except ImportError:
-    print("警告: 无法导入交易专用XIRR计算器，该功能将不可用")
-    XIRRCalculatorTradesOnly = None
-
 
 class TradeReportWindow(QMainWindow):
     """交易报告窗口"""
@@ -54,17 +47,6 @@ class TradeReportWindow(QMainWindow):
             print(f"无法使用标准XIRR计算器，切换到简化版: {str(e)}")
             from backtest_gui.utils.xirr_calculator_simple import XIRRCalculatorSimple
             self.xirr_calculator = XIRRCalculatorSimple(db_connector)
-            
-        # 初始化交易专用XIRR计算器
-        if XIRRCalculatorTradesOnly:
-            try:
-                self.trades_only_xirr_calculator = XIRRCalculatorTradesOnly(db_connector)
-                print("使用交易专用XIRR计算器")
-            except Exception as e:
-                print(f"无法初始化交易专用XIRR计算器: {str(e)}")
-                self.trades_only_xirr_calculator = None
-        else:
-            self.trades_only_xirr_calculator = None
             
         self.current_backtest_id = None  # 添加当前选中的回测ID
         
@@ -177,14 +159,11 @@ class TradeReportWindow(QMainWindow):
         self.xirr_button.setEnabled(True)  # 修改：默认启用
         self.xirr_button.clicked.connect(self.on_xirr_clicked)
         
-        # 移除交易专用XIRR计算按钮，因为已经移到了回测汇总表格的操作列中
-        
         self.export_excel_button = QPushButton("导出到Excel")
         self.export_excel_button.setEnabled(True)  # 修改：默认启用
         self.export_excel_button.clicked.connect(self.on_export_excel_clicked)
         
         buttons_layout.addWidget(self.xirr_button)
-        # 移除交易专用XIRR按钮
         buttons_layout.addWidget(self.export_excel_button)
         buttons_layout.addStretch()
         
@@ -384,11 +363,11 @@ class TradeReportWindow(QMainWindow):
             
             if summary_df is not None and not summary_df.empty:
                 # 设置表格列数
-                self.summary_table.setColumnCount(12)  # 增加了操作列
+                self.summary_table.setColumnCount(10)
                 
                 # 设置表头
                 headers = ["回测ID", "基金代码", "基金名称", "策略名称", "开始日期", "结束日期", 
-                          "最高占用资金", "买入次数", "卖出次数", "成本价", "年化收益率(%)", "操作"]
+                          "初始资金", "最终资金", "总收益", "收益率(%)"]
                 self.summary_table.setHorizontalHeaderLabels(headers)
                 
                 # 设置行数
@@ -418,53 +397,21 @@ class TradeReportWindow(QMainWindow):
                     end_date = row['end_date'].strftime("%Y-%m-%d") if pd.notna(row['end_date']) else ""
                     self.summary_table.setItem(i, 5, QTableWidgetItem(end_date))
                     
-                    # 最高占用资金 (计算为初始资金 - 最低现金)
-                    # 从交易记录中获取最高占用资金
-                    max_capital_used = self.trade_query.get_max_capital_used(row['id'])
-                    max_capital_used_str = f"{float(max_capital_used):,.2f}" if pd.notna(max_capital_used) else "0.00"
-                    self.summary_table.setItem(i, 6, QTableWidgetItem(max_capital_used_str))
+                    # 初始资金
+                    initial_capital = f"{float(row['initial_capital']):,.2f}" if pd.notna(row['initial_capital']) else "0.00"
+                    self.summary_table.setItem(i, 6, QTableWidgetItem(initial_capital))
                     
-                    # 买入次数
-                    buy_count = self.trade_query.get_buy_count(row['id'])
-                    self.summary_table.setItem(i, 7, QTableWidgetItem(str(buy_count)))
+                    # 最终资金
+                    final_capital = f"{float(row['final_capital']):,.2f}" if pd.notna(row['final_capital']) else "0.00"
+                    self.summary_table.setItem(i, 7, QTableWidgetItem(final_capital))
                     
-                    # 卖出次数
-                    sell_count = self.trade_query.get_sell_count(row['id'])
-                    self.summary_table.setItem(i, 8, QTableWidgetItem(str(sell_count)))
+                    # 总收益
+                    total_profit = f"{float(row['total_profit']):,.2f}" if pd.notna(row['total_profit']) else "0.00"
+                    self.summary_table.setItem(i, 8, QTableWidgetItem(total_profit))
                     
-                    # 成本价 (从持仓信息获取)
-                    avg_cost = self.trade_query.get_avg_cost(row['id'])
-                    avg_cost_str = f"{float(avg_cost):.4f}" if pd.notna(avg_cost) and avg_cost > 0 else "0.0000"
-                    self.summary_table.setItem(i, 9, QTableWidgetItem(avg_cost_str))
-                    
-                    # 年化收益率 (使用交易专用XIRR计算结果)
-                    xirr_value = self.trade_query.get_xirr_value(row['id'])
-                    if pd.notna(xirr_value) and xirr_value is not None:
-                        profit_rate = f"{float(xirr_value):.2f}%" if xirr_value != 0 else "0.00%"
-                    else:
-                        # 如果没有计算过XIRR，尝试计算
-                        if not hasattr(self, 'trades_only_xirr_calculator') or self.trades_only_xirr_calculator is None:
-                            from backtest_gui.utils.xirr_calculator_trades_only import XIRRCalculatorTradesOnly
-                            self.trades_only_xirr_calculator = XIRRCalculatorTradesOnly(self.db_connector)
-                        
-                        try:
-                            print(f"数据库中没有回测ID={row['id']}的XIRR值，尝试计算...")
-                            result = self.trades_only_xirr_calculator.calculate_backtest_xirr(row['id'])
-                            if result and 'xirr_value' in result and result['xirr_value'] is not None:
-                                profit_rate = f"{float(result['xirr_value']):.2f}%"
-                            else:
-                                profit_rate = "未计算"
-                        except Exception as e:
-                            print(f"计算XIRR失败: {str(e)}")
-                            profit_rate = "计算错误"
-                    
-                    self.summary_table.setItem(i, 10, QTableWidgetItem(profit_rate))
-                    
-                    # 添加操作按钮
-                    export_button = QPushButton("导出XIRR")
-                    export_button.setProperty("backtest_id", row['id'])
-                    export_button.clicked.connect(self.on_export_xirr_clicked)
-                    self.summary_table.setCellWidget(i, 11, export_button)
+                    # 收益率
+                    profit_rate = f"{float(row['total_profit_rate']):.2f}%" if pd.notna(row['total_profit_rate']) else "0.00%"
+                    self.summary_table.setItem(i, 9, QTableWidgetItem(profit_rate))
                     
                 # 调整列宽
                 self.summary_table.resizeColumnsToContents()
@@ -703,122 +650,19 @@ class TradeReportWindow(QMainWindow):
             # 恢复鼠标光标
             QApplication.restoreOverrideCursor()
             
+            # 显示错误信息
             error_msg = str(e)
             error_tb = traceback.format_exc()
-            print(f"计算XIRR出错: {error_msg}")
-            print(f"异常堆栈:\n{error_tb}")
             
-            QMessageBox.critical(self, "计算错误", f"计算XIRR时出错: {error_msg}")
+            print(f"计算XIRR异常: {error_msg}")
+            print(f"异常类型: {type(e).__name__}")
+            print(f"调用堆栈:\n{error_tb}")
             
-    def on_trades_only_xirr_clicked(self):
-        """点击计算交易专用XIRR按钮事件"""
-        print("\n=============== 交易专用XIRR计算调试 ===============")
-        print(f"当前选中的回测ID: {self.current_backtest_id}")
-        
-        # 强制启用按钮
-        self.trades_only_xirr_button.setEnabled(True)
-        
-        if not self.current_backtest_id:
-            print("错误: 未选中回测记录")
-            QMessageBox.warning(self, "警告", "请先选择一个回测记录")
-            return
+            # 显示详细错误对话框
+            detailed_msg = f"错误类型: {type(e).__name__}\n\n详细信息: {error_msg}\n\n调用堆栈:\n{error_tb}"
+            QMessageBox.critical(self, "XIRR计算错误", detailed_msg)
             
-        if not self.trades_only_xirr_calculator:
-            print("错误: 交易专用XIRR计算器不可用")
-            QMessageBox.warning(self, "功能不可用", "交易专用XIRR计算器不可用，请确保已正确安装")
-            return
-            
-        try:
-            print(f"开始计算交易专用XIRR, 回测ID: {self.current_backtest_id}")
-            
-            # 显示等待提示
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            print("设置等待光标")
-            
-            # 查询交易记录数量
-            conn = self.db_connector.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) FROM backtest_paired_trades WHERE backtest_id = %s
-            """, (self.current_backtest_id,))
-            count = cursor.fetchone()[0]
-            self.db_connector.release_connection(conn)
-            
-            if count == 0:
-                QApplication.restoreOverrideCursor()
-                QMessageBox.warning(self, "计算失败", "该回测没有交易记录，无法计算XIRR")
-                return
-            
-            # 计算交易专用XIRR
-            print("调用trades_only_xirr_calculator.calculate_backtest_xirr方法")
-            result = self.trades_only_xirr_calculator.calculate_backtest_xirr(self.current_backtest_id)
-            
-            # 恢复鼠标光标
-            QApplication.restoreOverrideCursor()
-            print("恢复鼠标光标")
-            
-            # 调试结果
-            print(f"计算结果: {result is not None}")
-            if result:
-                print(f"结果类型: {type(result)}")
-                print(f"结果键: {result.keys() if isinstance(result, dict) else 'Not a dict'}")
-            
-            if not result:
-                print("错误: 计算结果为空")
-                QMessageBox.warning(self, "计算失败", "无法计算交易专用XIRR，请检查交易数据")
-                return
-                
-            # 构建消息内容
-            message = f"回测ID: {result['backtest_info']['id']}\n"
-            message += f"基金代码: {result['backtest_info']['stock_code']}\n"
-            message += f"回测期间: {result['backtest_info']['start_date']} 至 {result['backtest_info']['end_date']}\n"
-            message += f"初始资金: {result['backtest_info']['initial_capital']:,.2f} (不计入XIRR计算)\n"
-            message += f"最终资金: {result['backtest_info']['final_capital']:,.2f}\n"
-            message += f"总收益: {result['backtest_info']['total_profit']:,.2f}\n"
-            message += f"总收益率: {result['backtest_info']['total_profit_rate']:.2f}%\n"
-            message += f"剩余股数: {result['remaining_shares']}\n\n"
-            
-            if result['xirr'] is not None:
-                message += f"交易专用XIRR(年化收益率): {result['xirr']:.2f}%"
-            else:
-                message += "交易专用XIRR(年化收益率): 无法计算"
-                
-            if result['has_incomplete_trades']:
-                message += "\n\n注意: 存在未完成交易，XIRR计算结果包含当前持仓价值"
-            
-            # 显示结果对话框
-            QMessageBox.information(self, "交易专用XIRR计算结果", message)
-            
-            # 询问是否导出到Excel
-            reply = QMessageBox.question(self, "导出到Excel", 
-                                        "是否将交易专用XIRR计算结果导出到Excel?", 
-                                        QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                # 选择保存路径
-                file_path, _ = QFileDialog.getSaveFileName(
-                    self, "保存Excel文件", 
-                    f"交易专用XIRR_{result['backtest_info']['stock_code']}_{self.current_backtest_id}.xlsx",
-                    "Excel文件 (*.xlsx)"
-                )
-                
-                if file_path:
-                    # 导出到Excel
-                    success = self.trades_only_xirr_calculator.export_to_excel(self.current_backtest_id, file_path)
-                    if success:
-                        QMessageBox.information(self, "导出成功", f"交易专用XIRR计算结果已导出至: {file_path}")
-                    else:
-                        QMessageBox.warning(self, "导出失败", "导出Excel失败，请检查文件路径和权限")
-            
-        except Exception as e:
-            # 恢复鼠标光标
-            QApplication.restoreOverrideCursor()
-            
-            error_msg = str(e)
-            error_tb = traceback.format_exc()
-            print(f"计算交易专用XIRR出错: {error_msg}")
-            print(f"异常堆栈:\n{error_tb}")
-            
-            QMessageBox.critical(self, "计算错误", f"计算交易专用XIRR时出错: {error_msg}")
+            print("============= XIRR计算调试结束 =============\n")
             
     def on_export_excel_clicked(self):
         """点击导出Excel按钮事件"""
@@ -865,89 +709,6 @@ class TradeReportWindow(QMainWindow):
             error_msg = str(e)
             QMessageBox.critical(self, "错误", f"导出Excel异常: {error_msg}")
             print(f"导出Excel异常: {error_msg}")
-            traceback.print_exc()
-
-    def on_export_xirr_clicked(self):
-        """导出XIRR按钮点击事件"""
-        try:
-            # 获取触发事件的按钮
-            button = self.sender()
-            if not button:
-                return
-                
-            # 获取按钮关联的回测ID
-            backtest_id = button.property("backtest_id")
-            if not backtest_id:
-                QMessageBox.warning(self, "导出失败", "无法获取回测ID")
-                return
-                
-            print(f"导出交易专用XIRR, 回测ID: {backtest_id}")
-            
-            # 显示等待提示
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            
-            # 获取回测基本信息
-            conn = self.db_connector.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT stock_code FROM backtest_results WHERE id = %s
-            """, (backtest_id,))
-            result = cursor.fetchone()
-            self.db_connector.release_connection(conn)
-            
-            if not result:
-                QApplication.restoreOverrideCursor()
-                QMessageBox.warning(self, "导出失败", "无法获取回测信息")
-                return
-                
-            stock_code = result[0]
-            
-            # 选择保存路径
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "保存Excel文件", 
-                f"交易专用XIRR_{stock_code}_{backtest_id}.xlsx",
-                "Excel文件 (*.xlsx)"
-            )
-            
-            if not file_path:
-                QApplication.restoreOverrideCursor()
-                return  # 用户取消保存
-                
-            # 确保文件名有.xlsx后缀
-            if not file_path.lower().endswith('.xlsx'):
-                file_path += '.xlsx'
-            
-            # 导出到Excel
-            if not self.trades_only_xirr_calculator:
-                from backtest_gui.utils.xirr_calculator_trades_only import XIRRCalculatorTradesOnly
-                self.trades_only_xirr_calculator = XIRRCalculatorTradesOnly(self.db_connector)
-                
-            success = self.trades_only_xirr_calculator.export_to_excel(backtest_id, file_path)
-            
-            # 恢复鼠标光标
-            QApplication.restoreOverrideCursor()
-            
-            if success:
-                QMessageBox.information(self, "导出成功", 
-                                       f"交易专用XIRR计算结果已导出至:\n{file_path}\n\n"
-                                       f"Excel文件包含三个工作表:\n"
-                                       f"1. XIRR汇总 - 包含回测汇总信息和XIRR计算结果\n"
-                                       f"2. 现金流数据 - 包含按日期排序的所有现金流数据，已将买入卖出后的剩余底仓和买入未卖出的底仓分开显示，并分别标记为两行不同的备注\n"
-                                       f"3. 持仓明细 - 包含所有未卖出份额的详细信息和估值，区分了买入卖出后剩余底仓和买入未卖出底仓两种类型\n\n"
-                                       f"注意：现金流数据中的底仓已经分为两种类型：\n"
-                                       f"- 买入卖出后剩余底仓：每次卖出交易后剩余的份额\n"
-                                       f"- 买入未卖出底仓：完全没有卖出过的份额")
-            else:
-                QMessageBox.warning(self, "导出失败", "导出Excel文件失败，请检查文件权限")
-                
-        except Exception as e:
-            # 恢复鼠标光标
-            QApplication.restoreOverrideCursor()
-            
-            # 显示错误信息
-            error_msg = str(e)
-            QMessageBox.critical(self, "错误", f"导出XIRR异常: {error_msg}")
-            print(f"导出XIRR异常: {error_msg}")
             traceback.print_exc()
 
 

@@ -383,9 +383,12 @@ class BandStrategy:
                 if self.open_trades[level.level]:
                     buy_trade = self.open_trades[level.level]
                     
-                    # 计算波段收益
-                    band_profit = sell_value - buy_trade['buy_value']
-                    band_profit_rate = (band_profit / buy_trade['buy_value']) * 100 if buy_trade['buy_value'] > 0 else 0
+                    # 计算卖出部分的波段收益
+                    band_profit = sell_value - (buy_trade['buy_value'] / buy_trade['buy_amount'] * sell_amount)
+                    sell_band_profit_rate = (band_profit / (buy_trade['buy_value'] / buy_trade['buy_amount'] * sell_amount)) * 100 if sell_amount > 0 else 0
+                    
+                    # 计算剩余份额
+                    remaining_shares = buy_trade['buy_amount'] - sell_amount
                     
                     # 创建完整的配对交易记录
                     paired_trade = {
@@ -397,9 +400,11 @@ class BandStrategy:
                         'sell_price': level.sell_price,
                         'sell_amount': sell_amount,
                         'sell_value': sell_value,
-                        'remaining': 0,
+                        'remaining': remaining_shares,  # 修改：正确记录剩余份额
+                        'remaining_shares': remaining_shares,  # 新字段：剩余份额
                         'band_profit': band_profit,
-                        'band_profit_rate': band_profit_rate,
+                        'band_profit_rate': 0,  # 旧字段，保持兼容
+                        'sell_band_profit_rate': sell_band_profit_rate,  # 新字段：卖出部分收益率
                         'status': '已完成',
                         'grid_type': level.grid_type
                     }
@@ -411,7 +416,7 @@ class BandStrategy:
                     self.open_trades[level.level] = None
                 
                 # 打印卖出信号生成
-                print(f"生成卖出信号: 档位={level.level}({level.grid_type}), 价格={level.sell_price}, 利润率={band_profit_rate:.2f}%")
+                print(f"生成卖出信号: 档位={level.level}({level.grid_type}), 价格={level.sell_price}, 利润率={sell_band_profit_rate:.2f}%")
                 
                 signals.append({
                     'time': time,
@@ -451,9 +456,11 @@ class BandStrategy:
                     'sell_price': None,
                     'sell_amount': None,
                     'sell_value': None,
-                    'remaining': trade['buy_amount'],
+                    'remaining': trade['buy_amount'],  # 旧字段，保持兼容
+                    'remaining_shares': trade['buy_amount'],  # 新字段：剩余份额
                     'band_profit': None,
                     'band_profit_rate': None,
+                    'sell_band_profit_rate': None,  # 新字段：卖出部分收益率
                     'status': '进行中',
                     'level': level,
                     'grid_type': trade['grid_type']
@@ -514,19 +521,23 @@ class BandStrategy:
                 sell_amount = trade['sell_amount']
                 sell_value = trade['sell_value']
                 remaining = trade['remaining']
+                remaining_shares = trade.get('remaining_shares', remaining)  # 使用新字段，如果没有则使用旧字段
                 band_profit = trade['band_profit']
                 band_profit_rate = trade['band_profit_rate']
+                sell_band_profit_rate = trade.get('sell_band_profit_rate', band_profit_rate)  # 使用新字段，如果没有则使用旧字段
                 status = trade['status']
                 
                 # 插入数据
                 cursor.execute("""
                     INSERT INTO backtest_paired_trades 
                     (backtest_id, level, grid_type, buy_time, buy_price, buy_amount, buy_value,
-                    sell_time, sell_price, sell_amount, sell_value, remaining, band_profit, band_profit_rate, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    sell_time, sell_price, sell_amount, sell_value, remaining, remaining_shares, 
+                    band_profit, band_profit_rate, sell_band_profit_rate, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     backtest_id, level, grid_type, buy_time, buy_price, buy_amount, buy_value,
-                    sell_time, sell_price, sell_amount, sell_value, remaining, band_profit, band_profit_rate, status
+                    sell_time, sell_price, sell_amount, sell_value, remaining, remaining_shares,
+                    band_profit, band_profit_rate, sell_band_profit_rate, status
                 ))
             
             # 提交事务

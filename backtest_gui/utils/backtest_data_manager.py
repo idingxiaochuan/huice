@@ -295,9 +295,11 @@ class BacktestDataManager:
                             None,  # sell_price
                             None,  # sell_amount
                             None,  # sell_value
-                            buy_record['amount'],  # remaining (默认为买入数量)
+                            buy_record['amount'],  # remaining (旧字段)
+                            buy_record['amount'],  # remaining_shares (新字段)
                             None,  # band_profit
-                            None,  # band_profit_rate
+                            None,  # band_profit_rate (旧字段)
+                            None,  # sell_band_profit_rate (新字段)
                             status
                         ]
                         
@@ -308,8 +310,14 @@ class BacktestDataManager:
                             record[9] = sell_record['amount']  # sell_amount
                             record[10] = sell_record['value']  # sell_value
                             record[11] = sell_record.get('remaining', buy_record['amount'] - sell_record['amount'])  # remaining
+                            # 计算正确的剩余份额
+                            remaining_shares = buy_record['amount'] - sell_record['amount']
+                            record.append(remaining_shares)  # remaining_shares
                             record[12] = sell_record.get('band_profit')  # band_profit
                             record[13] = sell_record.get('band_profit_rate')  # band_profit_rate
+                            # 卖出部分的收益率
+                            sell_band_profit_rate = sell_record.get('sell_band_profit_rate', sell_record.get('band_profit_rate'))
+                            record.append(sell_band_profit_rate)  # sell_band_profit_rate
                         
                         paired_trade_data.append(tuple(record))
                 
@@ -320,8 +328,8 @@ class BacktestDataManager:
                         """
                         INSERT INTO backtest_paired_trades
                         (backtest_id, level, grid_type, buy_time, buy_price, buy_amount, buy_value,
-                         sell_time, sell_price, sell_amount, sell_value, remaining, band_profit, 
-                         band_profit_rate, status)
+                         sell_time, sell_price, sell_amount, sell_value, remaining, remaining_shares, band_profit, 
+                         band_profit_rate, sell_band_profit_rate, status)
                         VALUES %s
                         """,
                         paired_trade_data
@@ -609,8 +617,8 @@ class BacktestDataManager:
                 cursor.execute(
                     """
                     SELECT id, level, grid_type, buy_time, buy_price, buy_amount, buy_value,
-                           sell_time, sell_price, sell_amount, sell_value, remaining, 
-                           band_profit, band_profit_rate, status
+                           sell_time, sell_price, sell_amount, sell_value, remaining, remaining_shares,
+                           band_profit, band_profit_rate, sell_band_profit_rate, status
                     FROM backtest_paired_trades
                     WHERE backtest_id = %s
                     ORDER BY buy_time
@@ -642,8 +650,10 @@ class BacktestDataManager:
                             'amount': row[9],
                             'value': row[10],
                             'remaining': row[11],
-                            'band_profit': row[12],
-                            'band_profit_rate': row[13],
+                            'remaining_shares': row[12],  # 新增字段：剩余份额
+                            'band_profit': row[13],
+                            'band_profit_rate': row[14],  # 旧字段
+                            'sell_band_profit_rate': row[15],  # 新字段：卖出部分收益率
                             'level': row[1],
                             'grid_type': row[2]
                         }
@@ -652,7 +662,7 @@ class BacktestDataManager:
                     result['paired_trades'][key] = {
                         'buy': buy_record,
                         'sell': sell_record,
-                        'status': row[14]
+                        'status': row[16]  # 状态字段索引更新
                     }
                 
                 # 4. 加载持仓信息

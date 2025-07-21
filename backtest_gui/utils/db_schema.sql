@@ -69,6 +69,18 @@ CREATE TABLE IF NOT EXISTS backtest_nav (
     nav NUMERIC(10, 4) NOT NULL                 -- 净值
 );
 
+-- 创建XIRR计算结果表，用于存储XIRR计算结果
+CREATE TABLE IF NOT EXISTS backtest_xirr (
+    id SERIAL PRIMARY KEY,
+    backtest_id INTEGER NOT NULL REFERENCES backtest_results(id) ON DELETE CASCADE, -- 关联的回测ID
+    xirr_value NUMERIC(10, 4),                -- XIRR值
+    xirr_type VARCHAR(20) NOT NULL,           -- XIRR类型(standard/trades_only)
+    calculation_time TIMESTAMP NOT NULL DEFAULT NOW(), -- 计算时间
+    has_incomplete_trades BOOLEAN NOT NULL DEFAULT FALSE, -- 是否有未完成交易
+    remaining_shares INTEGER,                 -- 剩余股数
+    notes TEXT                                -- 备注
+);
+
 -- 创建波段策略表，用于保存波段策略配置
 CREATE TABLE IF NOT EXISTS band_strategies (
     id SERIAL PRIMARY KEY,

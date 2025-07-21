@@ -52,7 +52,8 @@ class TradeQuery:
                         pt.id, pt.backtest_id, pt.level, pt.grid_type, 
                         pt.buy_time, pt.buy_price, pt.buy_amount, pt.buy_value,
                         pt.sell_time, pt.sell_price, pt.sell_amount, pt.sell_value, 
-                        pt.remaining, pt.band_profit, pt.band_profit_rate, pt.status,
+                        pt.remaining, pt.remaining_shares, pt.band_profit, 
+                        pt.band_profit_rate, pt.sell_band_profit_rate, pt.status,
                         br.stock_code, br.strategy_id, br.strategy_name,
                         fi.fund_name, fi.fund_type, fi.manager, fi.company
                     FROM 
@@ -297,3 +298,251 @@ class TradeQuery:
             print(f"查询回测汇总信息过程中出错: {str(e)}")
             traceback.print_exc()
             return None 
+
+    def get_max_capital_used(self, backtest_id):
+        """获取回测的最高占用资金
+        
+        Args:
+            backtest_id: 回测ID
+            
+        Returns:
+            float: 最高占用资金
+        """
+        try:
+            conn = self.db_connector.get_connection()
+            if not conn:
+                print("无法获取数据库连接")
+                return 0.0
+                
+            cursor = conn.cursor()
+            
+            # 获取所有配对交易记录，按时间排序
+            cursor.execute("""
+                SELECT id, buy_time, buy_value, sell_time, sell_value, remaining
+                FROM backtest_paired_trades
+                WHERE backtest_id = %s
+                ORDER BY buy_time
+            """, (backtest_id,))
+            
+            trades = cursor.fetchall()
+            if not trades:
+                return 0.0
+                
+            # 跟踪每个时间点的资金占用
+            time_points = []  # 时间点列表
+            capital_used = []  # 对应的资金占用
+            
+            # 初始资金占用为0
+            current_capital_used = 0.0
+            
+            # 处理每笔交易
+            for trade in trades:
+                trade_id = trade[0]
+                buy_time = trade[1]
+                buy_value = float(trade[2]) if trade[2] is not None else 0.0
+                sell_time = trade[3]
+                sell_value = float(trade[4]) if trade[4] is not None else 0.0
+                remaining = int(trade[5]) if trade[5] is not None else 0
+                
+                # 买入时增加资金占用
+                current_capital_used += buy_value
+                time_points.append(buy_time)
+                capital_used.append(current_capital_used)
+                
+                # 卖出时减少资金占用
+                if sell_time:
+                    # 如果有剩余股数，只减去卖出部分的资金占用
+                    if remaining > 0:
+                        # 计算卖出比例
+                        sell_ratio = sell_value / buy_value
+                        # 减去卖出部分的资金占用
+                        current_capital_used -= buy_value * sell_ratio
+                    else:
+                        # 全部卖出，减去全部买入金额
+                        current_capital_used -= buy_value
+                    
+                    time_points.append(sell_time)
+                    capital_used.append(current_capital_used)
+            
+            # 找出最大资金占用
+            if capital_used:
+                max_capital_used = max(capital_used)
+                print(f"回测ID {backtest_id} 的最高资金占用: {max_capital_used:.2f}")
+                return max_capital_used
+            else:
+                return 0.0
+            
+        except Exception as e:
+            print(f"获取最高占用资金失败: {str(e)}")
+            traceback.print_exc()
+            return 0.0
+        finally:
+            if conn:
+                self.db_connector.release_connection(conn)
+    
+    def get_buy_count(self, backtest_id):
+        """获取回测的买入次数
+        
+        Args:
+            backtest_id: 回测ID
+            
+        Returns:
+            int: 买入次数
+        """
+        try:
+            conn = self.db_connector.get_connection()
+            if not conn:
+                print("无法获取数据库连接")
+                return 0
+                
+            cursor = conn.cursor()
+            
+            # 查询买入次数（从配对交易记录中获取）
+            cursor.execute("""
+                SELECT COUNT(*) FROM backtest_paired_trades 
+                WHERE backtest_id = %s
+            """, (backtest_id,))
+            
+            result = cursor.fetchone()
+            if not result:
+                return 0
+                
+            return int(result[0])
+            
+        except Exception as e:
+            print(f"获取买入次数失败: {str(e)}")
+            traceback.print_exc()
+            return 0
+        finally:
+            if conn:
+                self.db_connector.release_connection(conn)
+    
+    def get_sell_count(self, backtest_id):
+        """获取回测的卖出次数
+        
+        Args:
+            backtest_id: 回测ID
+            
+        Returns:
+            int: 卖出次数
+        """
+        try:
+            conn = self.db_connector.get_connection()
+            if not conn:
+                print("无法获取数据库连接")
+                return 0
+                
+            cursor = conn.cursor()
+            
+            # 查询卖出次数（从配对交易记录中获取已完成的交易）
+            cursor.execute("""
+                SELECT COUNT(*) FROM backtest_paired_trades 
+                WHERE backtest_id = %s AND sell_time IS NOT NULL
+            """, (backtest_id,))
+            
+            result = cursor.fetchone()
+            if not result:
+                return 0
+                
+            return int(result[0])
+            
+        except Exception as e:
+            print(f"获取卖出次数失败: {str(e)}")
+            traceback.print_exc()
+            return 0
+        finally:
+            if conn:
+                self.db_connector.release_connection(conn)
+    
+    def get_avg_cost(self, backtest_id):
+        """获取回测的平均成本价
+        
+        Args:
+            backtest_id: 回测ID
+            
+        Returns:
+            float: 平均成本价
+        """
+        try:
+            conn = self.db_connector.get_connection()
+            if not conn:
+                print("无法获取数据库连接")
+                return 0.0
+                
+            cursor = conn.cursor()
+            
+            # 查询所有买入记录
+            cursor.execute("""
+                SELECT SUM(remaining) AS total_shares, SUM(remaining * buy_price) AS total_cost
+                FROM backtest_paired_trades
+                WHERE backtest_id = %s AND remaining > 0
+            """, (backtest_id,))
+            
+            result = cursor.fetchone()
+            if not result or not result[0] or float(result[0]) == 0:
+                return 0.0
+                
+            total_shares = float(result[0])
+            total_cost = float(result[1])
+            
+            # 计算平均成本
+            avg_cost = total_cost / total_shares if total_shares > 0 else 0.0
+            
+            return avg_cost
+            
+        except Exception as e:
+            print(f"获取平均成本价失败: {str(e)}")
+            traceback.print_exc()
+            return 0.0
+        finally:
+            if conn:
+                self.db_connector.release_connection(conn)
+    
+    def get_xirr_value(self, backtest_id):
+        """获取回测的交易专用XIRR值
+        
+        Args:
+            backtest_id: 回测ID
+            
+        Returns:
+            float: XIRR百分比值
+        """
+        try:
+            # 尝试从数据库中获取已计算的XIRR值
+            conn = self.db_connector.get_connection()
+            if not conn:
+                print("无法获取数据库连接")
+                return None
+                
+            cursor = conn.cursor()
+            
+            # 查询XIRR值
+            cursor.execute("""
+                SELECT xirr_value FROM backtest_xirr 
+                WHERE backtest_id = %s AND xirr_type = 'trades_only'
+                ORDER BY calculation_time DESC
+                LIMIT 1
+            """, (backtest_id,))
+            
+            result = cursor.fetchone()
+            if result and result[0] is not None:
+                return float(result[0])  # 返回百分比形式的XIRR值
+                
+            # 如果数据库中没有，则尝试计算
+            print(f"数据库中没有回测ID={backtest_id}的XIRR值，尝试计算...")
+            from backtest_gui.utils.xirr_calculator_trades_only import XIRRCalculatorTradesOnly
+            calculator = XIRRCalculatorTradesOnly(self.db_connector)
+            result = calculator.calculate_backtest_xirr(backtest_id)
+            
+            if result and 'xirr_value' in result and result['xirr_value'] is not None:
+                return float(result['xirr_value'])  # 返回百分比形式的XIRR值
+                
+            return None
+            
+        except Exception as e:
+            print(f"获取XIRR值失败: {str(e)}")
+            traceback.print_exc()
+            return None
+        finally:
+            if conn:
+                self.db_connector.release_connection(conn) 

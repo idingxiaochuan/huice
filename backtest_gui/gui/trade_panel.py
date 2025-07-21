@@ -135,7 +135,7 @@ class TradePanel(QWidget):
         self.paired_trade_table.setHorizontalHeaderLabels([
             "档位级别", "买入时间", "买入价格", "买入股数", "买入金额", 
             "卖出时间", "卖出价格", "卖出股数", "卖出金额", 
-            "剩余股数", "卖出收益率", "波段收益", "波段收益率", "状态"
+            "剩余份额", "卖出收益率", "卖出收益", "卖出收益率(%)", "状态"
         ])
         
         # 设置表格属性
@@ -316,9 +316,9 @@ class TradePanel(QWidget):
                 self.paired_trade_table.setItem(row, 7, QTableWidgetItem(f"{sell_record['amount']}"))
                 self.paired_trade_table.setItem(row, 8, QTableWidgetItem(f"{sell_record['value']:.2f}"))
                 
-                # 剩余股数
-                remaining = sell_record.get('remaining', buy_record['amount'] - sell_record['amount'] if buy_record else 0)
-                self.paired_trade_table.setItem(row, 9, QTableWidgetItem(f"{remaining}"))
+                # 剩余份额
+                remaining_shares = sell_record.get('remaining_shares', buy_record['amount'] - sell_record['amount'] if buy_record else 0)
+                self.paired_trade_table.setItem(row, 9, QTableWidgetItem(f"{remaining_shares}"))
                 
                 # 卖出收益率
                 if sell_record.get('sell_profit_rate') is not None:
@@ -329,7 +329,7 @@ class TradePanel(QWidget):
                         sell_profit_rate_item.setForeground(QBrush(QColor("green")))
                     self.paired_trade_table.setItem(row, 10, sell_profit_rate_item)
                 
-                # 波段收益和收益率
+                # 卖出收益
                 if sell_record['band_profit'] is not None:
                     profit_item = QTableWidgetItem(f"{sell_record['band_profit']:.2f}")
                     if sell_record['band_profit'] >= 0:
@@ -338,9 +338,11 @@ class TradePanel(QWidget):
                         profit_item.setForeground(QBrush(QColor("green")))
                     self.paired_trade_table.setItem(row, 11, profit_item)
                     
-                    if sell_record['band_profit_rate'] is not None:
-                        rate_item = QTableWidgetItem(f"{sell_record['band_profit_rate']:.2f}%")
-                        if sell_record['band_profit_rate'] >= 0:
+                    # 卖出收益率(%)
+                    sell_band_profit_rate = sell_record.get('sell_band_profit_rate', sell_record.get('band_profit_rate'))
+                    if sell_band_profit_rate is not None:
+                        rate_item = QTableWidgetItem(f"{sell_band_profit_rate:.2f}%")
+                        if sell_band_profit_rate >= 0:
                             rate_item.setForeground(QBrush(QColor("red")))
                         else:
                             rate_item.setForeground(QBrush(QColor("green")))
